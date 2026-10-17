@@ -13,6 +13,7 @@ export interface Register {
   unit: string;
   baseline: string;
   baseline_date: string | null;
+  last: { value: string; read_on: string | null; period: string } | null;
 }
 export interface Property {
   id: number;

@@ -63,6 +63,7 @@ export const ru = {
   'property.notConnected': 'Не подключён',
   'property.registers': 'Счётчики',
   'property.baseline': 'Начальное',
+  'property.last': 'Принято',
 
   'readings.title': 'Показания',
   'readings.was': 'Было',

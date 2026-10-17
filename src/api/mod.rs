@@ -336,11 +336,25 @@ async fn property_json(st: &ApiState, ctx: &Ctx, property_id: i64) -> Result<Val
     .bind(property_id)
     .fetch_all(st.app.pool())
     .await?;
-    let registers: Vec<Value> = REGISTERS
+    let mut registers: Vec<Value> = vec![];
+    for (code, label, unit, value, read_on) in REGISTERS
         .iter()
         .filter_map(|(code, _, _)| rows.iter().find(|r| r.0 == *code))
-        .map(|(code, label, unit, value, read_on)| json!({ "code": code, "label": label, "unit": unit, "baseline": value, "baseline_date": read_on }))
-        .collect();
+    {
+        // последнее принятое показание (стартовое, пока ни одного комплекта не принято) — от него считается следующий период
+        let last: Option<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT r.value, r.read_on, r.period FROM reading r JOIN register g ON g.id = r.register_id
+              WHERE g.property_id = ? AND g.code = ? AND r.status = 'confirmed' ORDER BY r.period DESC, r.id DESC LIMIT 1",
+        )
+        .bind(property_id)
+        .bind(code)
+        .fetch_optional(st.app.pool())
+        .await?;
+        registers.push(json!({
+            "code": code, "label": label, "unit": unit, "baseline": value, "baseline_date": read_on,
+            "last": last.map(|(value, read_on, period)| json!({ "value": value, "read_on": read_on, "period": period })),
+        }));
+    }
     let mut v = json!({
         "id": property_id,
         "name": name,

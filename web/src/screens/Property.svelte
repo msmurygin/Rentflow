@@ -176,9 +176,14 @@
             <div class="flex items-center justify-between border-t border-line py-3 first:border-t-0">
               <div>
                 <div>{t(`reg.${r.code}` as Key)}</div>
-                <div class="text-xs text-muted">{t('property.baseline')} · {dateLong(r.baseline_date)}</div>
+                <div class="text-xs text-muted">
+                  {r.last && r.last.period !== '0000-00' ? `${t('property.last')} · ${dateLong(r.last.read_on)}` : `${t('property.baseline')} · ${dateLong(r.baseline_date)}`}
+                </div>
+                {#if r.last && r.last.period !== '0000-00'}
+                  <div class="text-xs text-muted">{t('property.baseline')}: {num(r.baseline)}</div>
+                {/if}
               </div>
-              <div class="num text-lg font-semibold">{num(r.baseline)} <span class="text-sm font-normal text-muted">{r.unit}</span></div>
+              <div class="num text-lg font-semibold">{num(r.last?.value ?? r.baseline)} <span class="text-sm font-normal text-muted">{r.unit}</span></div>
             </div>
           {/each}
         </Card>

@@ -518,6 +518,15 @@ async fn full_month_over_http() {
                 .any(|r| r.photos.iter().any(|p| p.0.starts_with("local:")))
         );
     }
+    // «Квартира» показывает последнее принятое показание, а не только начальное
+    let (_, v) = api
+        .call(Method::GET, "/api/property", Some(&tenant), None)
+        .await;
+    let cold = &v["property"]["registers"][0];
+    assert_eq!(
+        (cold["baseline"].as_str(), cold["last"]["value"].as_str()),
+        (Some("753"), Some("755"))
+    );
     // повторная отправка не создаёт дублей
     let (s, v) = api
         .call(
