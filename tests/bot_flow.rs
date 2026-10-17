@@ -153,22 +153,18 @@ impl H {
         h
     }
 
-    /// Ручной ввод одного регистра: /enter → счётчик → число → «Верно».
-    async fn enter(&self, who: i64, code: &str, value: &str, now: NaiveDateTime) -> Vec<Reply> {
-        let r = self.say(who, "/enter", now).await;
-        let pick = button_ending(&r, &format!(":{code}"));
-        self.tap(who, &pick, now).await;
-        let r = self.say(who, value, now).await;
-        let ok = button_starting(&r, "ok:");
-        self.tap(who, &ok, now).await
+    /// Полный ввод формы: /enter → четыре числа по шагам → «Отправить». Возвращает ответы на «Отправить».
+    async fn month(&self, now: NaiveDateTime, v: [&str; 4]) -> Vec<Reply> {
+        self.say(TENANT, "/enter", now).await;
+        for value in v {
+            self.say(TENANT, value, now).await;
+        }
+        self.tap(TENANT, "send", now).await
     }
 
-    async fn month(&self, now: NaiveDateTime, v: [&str; 4]) -> Vec<Reply> {
-        let mut last = vec![];
-        for (code, value) in ["cold", "hot", "t1", "t2"].into_iter().zip(v) {
-            last = self.enter(TENANT, code, value, now).await;
-        }
-        last
+    async fn drafts(&self) -> i64 {
+        self.count("SELECT count(*) FROM pending_reading WHERE status = 'open'")
+            .await
     }
 }
 
@@ -179,18 +175,19 @@ fn buttons(replies: &[Reply]) -> Vec<String> {
         .collect()
 }
 
-fn button_ending(replies: &[Reply], suffix: &str) -> String {
-    buttons(replies)
-        .into_iter()
-        .find(|d| d.ends_with(suffix))
-        .unwrap_or_else(|| panic!("no button *{suffix} in {replies:?}"))
-}
-
 fn button_starting(replies: &[Reply], prefix: &str) -> String {
     buttons(replies)
         .into_iter()
         .find(|d| d.starts_with(prefix))
         .unwrap_or_else(|| panic!("no button {prefix}* in {replies:?}"))
+}
+
+fn all_text(replies: &[Reply]) -> String {
+    replies
+        .iter()
+        .map(|r| r.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n")
 }
 
 fn to_chat(replies: &[Reply], who: i64) -> String {
@@ -225,15 +222,20 @@ async fn bootstrap_creates_baseline_but_no_bill_and_keeps_unknown_date() {
 }
 
 #[tokio::test]
-async fn wizard_rejects_bad_input_and_asks_again() {
+async fn wizard_shows_progress_rejects_bad_input_and_asks_again() {
     let h = H::new().await;
-    h.say(LANDLORD, "/setup", at(2026, 6, 26)).await;
-    h.say(LANDLORD, "Квартира", at(2026, 6, 26)).await;
+    let r = h.say(LANDLORD, "/setup", at(2026, 6, 26)).await;
+    assert!(r[0].text.contains("(1/13)"), "{r:?}");
+    let r = h.say(LANDLORD, "Квартира", at(2026, 6, 26)).await;
+    assert!(r[0].text.contains("(2/13)"), "{r:?}");
     h.say(LANDLORD, "Иван", at(2026, 6, 26)).await;
     let r = h.say(LANDLORD, "вчера", at(2026, 6, 26)).await;
     assert!(r[0].text.contains("Не получилось разобрать"), "{r:?}");
     let r = h.say(LANDLORD, "25.06.2026", at(2026, 6, 26)).await;
-    assert!(r[0].text.contains("ХВС"), "{r:?}");
+    assert!(
+        r[0].text.contains("(4/13)") && r[0].text.contains("ХВС"),
+        "{r:?}"
+    );
     let r = h.say(LANDLORD, "-5", at(2026, 6, 26)).await;
     assert!(r[0].text.contains("Не получилось разобрать"), "{r:?}");
 }
@@ -256,7 +258,6 @@ async fn invite_is_one_time_and_expires() {
     let token = r[0].text.split("start=").nth(1).unwrap().trim().to_string();
     assert!(r[0].text.contains("https://t.me/rentflow_bot?start="));
 
-    // чужой человек пробует просроченный токен
     let r = h
         .send(
             STRANGER,
@@ -275,11 +276,18 @@ async fn invite_is_one_time_and_expires() {
         .await;
     assert!(r[0].text.contains("Вы подключены"), "{r:?}");
     assert!(
+        r[0].text.contains("по шагам"),
+        "приветствие объясняет сценарий: {r:?}"
+    );
+    assert!(
+        buttons(&r).contains(&"enter".to_string()),
+        "в приветствии есть кнопка ввода"
+    );
+    assert!(
         r.iter()
             .any(|x| x.chat_id == LANDLORD * 100 && x.text.contains("подключился"))
     );
 
-    // токен уже использован
     let r = h
         .send(STRANGER, Incoming::Start(Some(token)), at(2026, 6, 27))
         .await;
@@ -289,6 +297,165 @@ async fn invite_is_one_time_and_expires() {
             .await,
         1
     );
+}
+
+// ---------- ввод показаний: понятный сценарий ----------
+
+#[tokio::test]
+async fn entry_is_a_stepwise_form_with_one_send_button() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+
+    let r = h.say(TENANT, "/enter", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Шаг 1 из 4") && text.contains("Холодная вода"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Прошлое показание: 753"),
+        "показывается прошлое значение: {text}"
+    );
+
+    let r = h.say(TENANT, "755", now).await;
+    assert!(
+        all_text(&r).contains("✔ Холодная вода (ХВС): 755") && all_text(&r).contains("Шаг 2 из 4"),
+        "{r:?}"
+    );
+    let r = h.say(TENANT, "417", now).await;
+    assert!(all_text(&r).contains("Шаг 3 из 4"), "{r:?}");
+    let r = h.say(TENANT, "3975,48", now).await;
+    assert!(all_text(&r).contains("Шаг 4 из 4"), "{r:?}");
+    // до «Отправить» ничего не записано и владелец ничего не получил
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
+            .await,
+        0
+    );
+    let r = h.say(TENANT, "1179", now).await;
+    let summary = all_text(&r);
+    assert!(
+        summary.contains("Проверьте показания за 2026-07"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("расход 2 м³") && summary.contains("расход 144 кВт·ч"),
+        "в сводке виден расход: {summary}"
+    );
+    assert!(
+        buttons(&r).contains(&"send".to_string()) && buttons(&r).contains(&"ed:t1".to_string()),
+        "{r:?}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
+            .await,
+        0,
+        "сводка ещё не отправка"
+    );
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
+
+    let r = h.tap(TENANT, "send", now).await;
+    assert!(
+        to_chat(&r, TENANT).contains("Показания отправлены"),
+        "{r:?}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted' AND status = 'confirmed'")
+            .await,
+        4
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM bill WHERE status = 'draft'")
+            .await,
+        1
+    );
+    assert_eq!(h.drafts().await, 0);
+}
+
+#[tokio::test]
+async fn invalid_number_keeps_the_same_step() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    let r = h.say(TENANT, "abc", now).await;
+    assert!(r[0].text.contains("Нужно число"), "{r:?}");
+    let r = h.say(TENANT, "750", now).await; // меньше стартового 753
+    assert!(
+        r[0].text.contains("меньше прошлого показания (753)"),
+        "{r:?}"
+    );
+    assert_eq!(h.drafts().await, 0, "неверные значения не сохраняются");
+    let r = h.say(TENANT, "755", now).await;
+    assert!(
+        all_text(&r).contains("Шаг 2 из 4"),
+        "тот же шаг принял верное значение: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn any_value_can_be_edited_from_the_summary() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    for v in ["755", "417", "3975", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    let r = h.tap(TENANT, "ed:hot", now).await;
+    assert!(
+        all_text(&r).contains("Горячая вода") && all_text(&r).contains("Прошлое показание: 416"),
+        "{r:?}"
+    );
+    let r = h.say(TENANT, "418", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Проверьте показания") && text.contains("Горячая вода (ГВС): 418"),
+        "после правки снова сводка: {text}"
+    );
+    assert!(!text.contains("Горячая вода (ГВС): 417"));
+    assert_eq!(
+        h.drafts().await,
+        4,
+        "правка заменяет значение, а не добавляет второе"
+    );
+}
+
+#[tokio::test]
+async fn cancel_discards_the_form_and_stores_nothing() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    h.say(TENANT, "755", now).await;
+    h.say(TENANT, "417", now).await;
+    assert_eq!(h.drafts().await, 2);
+    let r = h.tap(TENANT, "cx", now).await;
+    assert!(r[0].text.contains("отменён"), "{r:?}");
+    assert_eq!(h.drafts().await, 0);
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
+            .await,
+        0
+    );
+    // старая кнопка «Отправить» после отмены ничего не отправляет
+    let r = h.tap(TENANT, "send", now).await;
+    assert!(r[0].text.contains("Нечего отправлять"), "{r:?}");
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
+}
+
+#[tokio::test]
+async fn double_send_makes_one_bill() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.month(now, ["755", "417", "3975", "1179"]).await;
+    let again = h.tap(TENANT, "send", now).await;
+    assert!(again[0].text.contains("уже отправлены"), "{again:?}");
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 1);
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted' AND status = 'confirmed'")
+            .await,
+        4
+    );
+    let r = h.say(TENANT, "/enter", now).await;
+    assert!(r[0].text.contains("уже отправлен владельцу"), "{r:?}");
 }
 
 // ---------- расчёт и golden ----------
@@ -318,7 +485,7 @@ async fn golden_three_months_through_the_bot() {
         ),
     ] {
         if month == "2026-08" {
-            // тарифы воды и водоотведения изменились с 1 августа
+            // тарифы воды и водоотведения изменились с 1 августа (строкой — для опытных пользователей)
             for cmd in [
                 "/tariff cold 66,87 2026-08-01",
                 "/tariff hot 317,71 2026-08-01",
@@ -339,17 +506,16 @@ async fn golden_three_months_through_the_bot() {
             draft.text
         );
         assert!(draft.text.contains("Водоотведение"), "{}", draft.text);
-        // арендатору итог ещё не показан
         assert!(
             !to_chat(&r, TENANT).contains("Итого"),
             "{month}: сумма ушла арендатору до утверждения"
         );
         let ap = button_starting(&r, "ap:");
         let r = h.tap(LANDLORD, &ap, now).await;
-        let tenant_msg = to_chat(&r, TENANT);
         assert!(
-            tenant_msg.contains(&format!("Итого: {expected} ₽")),
-            "{tenant_msg}"
+            to_chat(&r, TENANT).contains(&format!("Итого: {expected} ₽")),
+            "{}",
+            to_chat(&r, TENANT)
         );
         totals.push(expected);
         let paid = button_starting(&r, "pd:");
@@ -361,7 +527,6 @@ async fn golden_three_months_through_the_bot() {
             .await,
         3
     );
-    // июльский T1: на счётчике 3975,48, в расчёте целая часть — исходное значение сохранено рядом
     let raw: String = sqlx::query_scalar(
         "SELECT r.value FROM reading r JOIN register g ON g.id = r.register_id WHERE g.code = 't1' AND r.period = '2026-07' AND r.status = 'confirmed'",
     )
@@ -389,33 +554,28 @@ async fn t1_and_t2_are_billed_separately() {
 }
 
 #[tokio::test]
-async fn missing_register_blocks_billing_and_names_what_is_missing() {
+async fn missing_register_blocks_sending_and_billing() {
     let h = H::ready().await;
     let now = at(2026, 7, 25);
-    for (code, v) in [("cold", "755"), ("hot", "417"), ("t1", "3975")] {
-        h.enter(TENANT, code, v, now).await;
+    h.say(TENANT, "/enter", now).await;
+    for v in ["755", "417", "3975"] {
+        h.say(TENANT, v, now).await;
     }
-    let r = h.say(TENANT, "/readings", now).await;
+    let r = h.tap(TENANT, "send", now).await;
     assert!(r[0].text.contains("Не хватает: Электричество T2"), "{r:?}");
+    let r = h.say(TENANT, "/readings", now).await;
+    assert!(
+        r[0].text.contains("Черновик") && r[0].text.contains("Не хватает"),
+        "{r:?}"
+    );
     assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
-    let r = h.say(LANDLORD, "/calc", now).await;
-    assert!(r[0].text.contains("неполные"), "{r:?}");
-}
-
-#[tokio::test]
-async fn reading_below_the_previous_one_is_not_accepted() {
-    let h = H::ready().await;
-    let now = at(2026, 7, 25);
-    let r = h.say(TENANT, "/enter", now).await;
-    h.tap(TENANT, &button_ending(&r, ":cold"), now).await;
-    let r = h.say(TENANT, "750", now).await;
-    let r = h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
-    assert!(r[0].text.contains("меньше предыдущего"), "{r:?}");
     assert_eq!(
         h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
             .await,
         0
     );
+    let r = h.say(LANDLORD, "/calc", now).await;
+    assert!(r[0].text.contains("неполные"), "{r:?}");
 }
 
 #[tokio::test]
@@ -430,7 +590,6 @@ async fn tariff_change_inside_the_period_blocks_automatic_billing() {
         landlord.contains("тариф менялся внутри периода"),
         "{landlord}"
     );
-    // владелец исправил тарифы так, чтобы смена пришлась на границу периодов, и пересчитал
     sqlx::query("UPDATE tariff SET valid_from = '2026-08-01' WHERE code = 't1' AND price = '9'")
         .execute(h.app.pool())
         .await
@@ -447,7 +606,168 @@ async fn sewer_can_be_turned_off_explicitly() {
     let r = h.month(now, ["755", "417", "3975", "1179"]).await;
     let draft = &r.iter().find(|x| x.chat_id == LANDLORD * 100).unwrap().text;
     assert!(!draft.contains("Водоотведение"), "{draft}");
-    assert!(draft.contains("Итого: 1908,75 ₽"), "{draft}"); // 2063,61 − 154,86
+    assert!(draft.contains("Итого: 1908,75 ₽"), "{draft}");
+}
+
+// ---------- меню тарифов ----------
+
+#[tokio::test]
+async fn tariff_menu_walks_through_every_item_and_saves_once() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 30);
+    let r = h.say(LANDLORD, "/tariff", now).await;
+    assert!(r[0].text.contains("С какой даты"), "{r:?}");
+    assert!(
+        buttons(&r).contains(&"td:2026-08-01".to_string()),
+        "кнопка «с 1-го числа следующего месяца»: {r:?}"
+    );
+
+    let r = h.tap(LANDLORD, "td:2026-08-01", now).await;
+    assert!(
+        r[0].text.contains("Шаг 1 из 5") && r[0].text.contains("Сейчас: 65,77 ₽"),
+        "{r:?}"
+    );
+    let r = h.say(LANDLORD, "66,87", now).await;
+    assert!(
+        r[0].text.contains("Шаг 2 из 5") && r[0].text.contains("Сейчас: 312,50"),
+        "{r:?}"
+    );
+    let r = h.say(LANDLORD, "317,71", now).await;
+    assert!(
+        r[0].text.contains("Шаг 3 из 5") && r[0].text.contains("Водоотведение"),
+        "{r:?}"
+    );
+    assert!(
+        buttons(&r).contains(&"toff".to_string()),
+        "водоотведение можно выключить: {r:?}"
+    );
+    h.say(LANDLORD, "52,48", now).await;
+    h.tap(LANDLORD, "tk", now).await; // T1 без изменений
+    let r = h.tap(LANDLORD, "tk", now).await; // T2 без изменений
+    let text = all_text(&r);
+    assert!(
+        text.contains("Холодная вода (ХВС): 65,77 ₽ → 66,87 ₽"),
+        "{text}"
+    );
+    assert!(text.contains("Водоотведение: 51,62 ₽ → 52,48 ₽"), "{text}");
+    assert!(
+        !text.contains("T1"),
+        "неизменённое в сводку не попадает: {text}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-08-01'")
+            .await,
+        0,
+        "до «Сохранить» ничего не записано"
+    );
+
+    let r = h.tap(LANDLORD, "ts", now).await;
+    assert!(r[0].text.contains("Тарифы сохранены"), "{r:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-08-01'")
+            .await,
+        3
+    );
+    // повторное «Сохранить» ничего не дублирует
+    let again = h.tap(LANDLORD, "ts", now).await;
+    assert!(again[0].text.contains("уже сохранены"), "{again:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-08-01'")
+            .await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn tariff_menu_with_no_changes_stores_nothing() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 30);
+    h.say(LANDLORD, "/tariff", now).await;
+    h.tap(LANDLORD, "td:2026-08-01", now).await;
+    let mut last = vec![];
+    for _ in 0..5 {
+        last = h.tap(LANDLORD, "tk", now).await;
+    }
+    assert!(last[0].text.contains("Ничего не меняется"), "{last:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-08-01'")
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn tariff_menu_can_turn_sewer_off() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 30);
+    h.say(LANDLORD, "/tariff", now).await;
+    h.say(LANDLORD, "2026-08-01", now).await; // дату можно ввести текстом
+    h.tap(LANDLORD, "tk", now).await;
+    h.tap(LANDLORD, "tk", now).await;
+    let r = h.tap(LANDLORD, "toff", now).await;
+    assert!(r[0].text.contains("Шаг 4 из 5"), "{r:?}");
+    h.tap(LANDLORD, "tk", now).await;
+    let r = h.tap(LANDLORD, "tk", now).await;
+    assert!(all_text(&r).contains("выключить"), "{r:?}");
+    h.tap(LANDLORD, "ts", now).await;
+    assert_eq!(h.count("SELECT sewer_enabled FROM property").await, 0);
+}
+
+#[tokio::test]
+async fn tariff_menu_validates_input_and_can_be_cancelled() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 30);
+    h.say(LANDLORD, "/tariff", now).await;
+    let r = h.say(LANDLORD, "завтра", now).await;
+    assert!(r[0].text.contains("Не получилось разобрать дату"), "{r:?}");
+    h.say(LANDLORD, "2026-08-01", now).await;
+    let r = h.say(LANDLORD, "много", now).await;
+    assert!(r[0].text.contains("Нужно число"), "{r:?}");
+    let r = h.say(LANDLORD, "-3", now).await;
+    assert!(r[0].text.contains("Нужно число"), "{r:?}");
+    // шаг не сдвинулся — принимается верная цена для ХВС
+    let r = h.say(LANDLORD, "66,87", now).await;
+    assert!(r[0].text.contains("Шаг 2 из 5"), "{r:?}");
+    let r = h.tap(LANDLORD, "tx", now).await;
+    assert!(r[0].text.contains("отменён"), "{r:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-08-01'")
+            .await,
+        0
+    );
+    // после отмены кнопка «Сохранить» из старого сообщения ничего не делает
+    let r = h.tap(LANDLORD, "ts", now).await;
+    assert!(
+        r[0].text.contains("уже сохранены или меню закрыто"),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn tariff_menu_refuses_a_duplicate_date_and_tenant_cannot_use_it() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 30);
+    // на 2026-01-01 тарифы уже заведены мастером
+    h.say(LANDLORD, "/tariff", now).await;
+    h.tap(LANDLORD, "td:2026-01-01", now).await;
+    h.say(LANDLORD, "70", now).await;
+    for _ in 0..4 {
+        h.tap(LANDLORD, "tk", now).await;
+    }
+    let r = h.tap(LANDLORD, "ts", now).await;
+    assert!(r[0].text.contains("уже есть"), "{r:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE code = 'cold'")
+            .await,
+        1
+    );
+
+    for data in ["ts", "td:2026-08-01", "tk", "tx"] {
+        let r = h.tap(TENANT, data, now).await;
+        assert!(r[0].text.contains("недоступно"), "{data}: {r:?}");
+    }
+    let r = h.say(TENANT, "/tariff", now).await;
+    assert!(!r[0].text.contains("С какой даты"), "{r:?}");
 }
 
 // ---------- публикация и права ----------
@@ -458,7 +778,7 @@ async fn landlord_must_approve_before_the_tenant_sees_any_amount() {
     let now = at(2026, 7, 25);
     let r = h.month(now, ["755", "417", "3975", "1179"]).await;
     let tenant_text = to_chat(&r, TENANT);
-    assert!(tenant_text.contains("проверку"), "{tenant_text}");
+    assert!(tenant_text.contains("Владелец проверит"), "{tenant_text}");
     assert!(!tenant_text.contains("2063"), "{tenant_text}");
     assert_eq!(
         h.count("SELECT count(*) FROM bill WHERE status = 'draft'")
@@ -466,7 +786,6 @@ async fn landlord_must_approve_before_the_tenant_sees_any_amount() {
         1
     );
 
-    // отклонение: арендатору суммы не уходят, показания открываются заново
     let rj = button_starting(&r, "rj:");
     let rr = h.tap(LANDLORD, &rj, now).await;
     assert!(!to_chat(&rr, TENANT).contains("2063"));
@@ -478,7 +797,6 @@ async fn landlord_must_approve_before_the_tenant_sees_any_amount() {
     let r = h.say(TENANT, "/readings", now).await;
     assert!(r[0].text.contains("Не хватает"), "{r:?}");
 
-    // после исправления снова черновик → утверждение один раз
     let r = h.month(now, ["755", "417", "3975", "1179"]).await;
     let ap = button_starting(&r, "ap:");
     let first = h.tap(LANDLORD, &ap, now).await;
@@ -509,10 +827,9 @@ async fn tenant_cannot_approve_pay_or_use_landlord_commands() {
 }
 
 #[tokio::test]
-async fn tenant_cannot_touch_another_tenants_property_or_cards() {
+async fn tenant_cannot_touch_another_tenants_property_or_forms() {
     let h = H::ready().await;
     let now = at(2026, 7, 25);
-    // второй объект и его арендатор (4 регистра), заведённые напрямую
     let pool = h.app.pool();
     sqlx::query("INSERT INTO app_user (id, telegram_id, chat_id, role, created_at) VALUES (50, 50, 5000, 'landlord', 'x'), (51, 51, 5100, 'tenant', 'x')").execute(pool).await.unwrap();
     sqlx::query("INSERT INTO property (id, landlord_id, name, created_at) VALUES (9, 50, 'Чужая квартира', 'x')").execute(pool).await.unwrap();
@@ -531,18 +848,19 @@ async fn tenant_cannot_touch_another_tenants_property_or_cards() {
             .unwrap();
     }
 
-    // карточка первого арендатора
-    let r = h.say(TENANT, "/enter", now).await;
-    let r = h.tap(TENANT, &button_ending(&r, ":cold"), now).await;
-    let _ = r;
-    let r = h.say(TENANT, "755", now).await;
-    let ok = button_starting(&r, "ok:");
+    // первый арендатор начал форму
+    h.say(TENANT, "/enter", now).await;
+    h.say(TENANT, "755", now).await;
+    assert_eq!(h.drafts().await, 1);
 
-    // второй арендатор не может подтвердить чужую карточку
-    let r = h.send(51, Incoming::Callback(ok.clone()), now).await;
-    assert!(
-        r[0].text.contains("Уже подтверждено") || r[0].text.contains("недоступн"),
-        "{r:?}"
+    // второй не может ни отправить, ни отменить, ни править чужую форму
+    let r = h.send(51, Incoming::Callback("send".into()), now).await;
+    assert!(r[0].text.contains("Нечего отправлять"), "{r:?}");
+    h.send(51, Incoming::Callback("cx".into()), now).await;
+    assert_eq!(
+        h.drafts().await,
+        1,
+        "чужая отмена не трогает форму первого арендатора"
     );
     assert_eq!(
         h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
@@ -550,12 +868,9 @@ async fn tenant_cannot_touch_another_tenants_property_or_cards() {
         0
     );
 
-    // и его собственные показания попадают только на его объект
+    // его собственный ввод привязан только к его объекту: у него нет прошлых показаний
     let r = h.send(51, Incoming::Text("/enter".into()), now).await;
-    let pick = button_ending(&r, ":cold");
-    h.send(51, Incoming::Callback(pick), now).await;
-    let r = h.send(51, Incoming::Text("5".into()), now).await;
-    let _ = r;
+    assert!(all_text(&r).contains("Прошлого показания нет"), "{r:?}");
 
     // посторонний без приглашения не может отправлять показания и фото
     let r = h.photo(STRANGER, "X1", now).await;
@@ -567,34 +882,44 @@ async fn tenant_cannot_touch_another_tenants_property_or_cards() {
 // ---------- фото, дубли, ошибки распознавания ----------
 
 #[tokio::test]
-async fn photo_is_recognised_then_confirmed_and_original_is_kept() {
+async fn photo_fills_the_form_and_is_confirmed_on_the_summary_with_original_kept() {
     let dir = std::env::temp_dir().join(format!("rentflow-test-{}", uuid::Uuid::new_v4()));
     let h = H::with_photo_dir(Some(dir.clone())).await;
     h.setup(at(2026, 6, 26)).await;
     h.connect_tenant(at(2026, 6, 26)).await;
     let now = at(2026, 7, 25);
+
     h.ocr.push(Ok(vec![cand("cold", "755.012", "high")]));
     let r = h.photo(TENANT, "PH1", now).await;
+    let text = all_text(&r);
     assert!(
-        r[0].text.contains("ХВС") && r[0].text.contains("755,012"),
-        "{r:?}"
+        text.contains("Распознано: Холодная вода (ХВС) = 755,012"),
+        "{text}"
     );
-    // до подтверждения ничего не записано
+    assert!(
+        text.contains("Шаг 2 из 4"),
+        "дальше форма просит следующий счётчик: {text}"
+    );
     assert_eq!(
         h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
             .await,
-        0
+        0,
+        "до сводки ничего не записано"
     );
-    h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
-    let (value, ai, path, uid): (String, String, String, String) = sqlx::query_as(
-        "SELECT value, ai_value, photo_path, photo_unique_id FROM reading WHERE kind = 'submitted'",
+
+    for v in ["417", "3975", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    h.tap(TENANT, "send", now).await;
+    let (value, ai, path, uid, source): (String, String, String, String, String) = sqlx::query_as(
+        "SELECT value, ai_value, photo_path, photo_unique_id, source FROM reading WHERE kind = 'submitted' AND photo_unique_id IS NOT NULL",
     )
     .fetch_one(h.app.pool())
     .await
     .unwrap();
     assert_eq!(
-        (value.as_str(), ai.as_str(), uid.as_str()),
-        ("755.012", "755.012", "PH1")
+        (value.as_str(), ai.as_str(), uid.as_str(), source.as_str()),
+        ("755.012", "755.012", "PH1", "photo")
     );
     assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3]);
     let _ = std::fs::remove_dir_all(dir);
@@ -605,31 +930,28 @@ async fn duplicate_photo_never_duplicates_a_reading_or_a_charge() {
     let h = H::ready().await;
     let now = at(2026, 7, 25);
     h.ocr.push(Ok(vec![cand("cold", "755", "high")]));
-    let r = h.photo(TENANT, "DUP", now).await;
-    let ok = button_starting(&r, "ok:");
-    // то же фото до подтверждения: возвращается та же карточка, новой не создаётся
+    h.photo(TENANT, "DUP", now).await;
+    // то же фото ещё раз до отправки: не принимается, форма не дублируется
     let again = h.photo(TENANT, "DUP", now).await;
-    assert_eq!(h.count("SELECT count(*) FROM pending_reading").await, 1);
-    assert!(again[0].text.contains("на проверке"), "{again:?}");
-    // двойное нажатие «Верно»
-    h.tap(TENANT, &ok, now).await;
-    let twice = h.tap(TENANT, &ok, now).await;
-    assert!(twice[0].text.contains("Уже подтверждено"), "{twice:?}");
-    // то же фото после подтверждения
-    let r = h.photo(TENANT, "DUP", now).await;
-    assert!(r[0].text.contains("уже принято"), "{r:?}");
+    assert!(
+        again[0].text.contains("Повторно оно не учитывается"),
+        "{again:?}"
+    );
+    assert_eq!(h.drafts().await, 1);
+
+    for v in ["417", "3975", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    h.tap(TENANT, "send", now).await;
+    h.tap(TENANT, "send", now).await; // двойное нажатие
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 1);
     assert_eq!(
         h.count("SELECT count(*) FROM reading WHERE kind = 'submitted' AND status = 'confirmed'")
             .await,
-        1
+        4
     );
-
-    // после полного набора и расчёта новые показания за тот же период не принимаются
-    for (code, v) in [("hot", "417"), ("t1", "3975"), ("t2", "1179")] {
-        h.enter(TENANT, code, v, now).await;
-    }
-    assert_eq!(h.count("SELECT count(*) FROM bill").await, 1);
-    let r = h.say(TENANT, "/enter", now).await;
+    // после отправки период закрыт для новых показаний, повторный расчёт не создаёт второй счёт
+    let r = h.photo(TENANT, "DUP2", now).await;
     assert!(r[0].text.contains("уже отправлен владельцу"), "{r:?}");
     let r = h.say(LANDLORD, "/calc", now).await;
     assert!(r[0].text.contains("счёт уже есть"), "{r:?}");
@@ -642,18 +964,21 @@ async fn ai_outage_falls_back_to_manual_entry() {
     let now = at(2026, 7, 25);
     h.ocr.push(Err("timeout".into()));
     let r = h.photo(TENANT, "A1", now).await;
-    assert!(r[0].text.contains("недоступно"), "{r:?}");
-    // карточка без регистра: выбираем счётчик и вводим значение руками
-    let r = h.tap(TENANT, &button_ending(&r, ":hot"), now).await;
-    assert!(r[0].text.contains("введите показание"), "{r:?}");
-    let r = h.say(TENANT, "417", now).await;
-    h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
-    let (v, src): (String, String) =
-        sqlx::query_as("SELECT value, source FROM reading WHERE kind = 'submitted'")
-            .fetch_one(h.app.pool())
-            .await
-            .unwrap();
-    assert_eq!((v.as_str(), src.as_str()), ("417", "photo"));
+    let text = all_text(&r);
+    assert!(
+        text.contains("недоступно") && text.contains("Шаг 1 из 4"),
+        "{text}"
+    );
+    for v in ["755", "417", "3975", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    h.tap(TENANT, "send", now).await;
+    assert_eq!(
+        h.count("SELECT count(*) FROM reading WHERE source = 'manual' AND kind = 'submitted'")
+            .await,
+        4
+    );
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 1);
 }
 
 #[tokio::test]
@@ -662,78 +987,98 @@ async fn wrong_ai_value_can_be_corrected_and_both_values_are_kept() {
     let now = at(2026, 7, 25);
     h.ocr.push(Ok(vec![cand("t1", "3915,48", "low")])); // ошибка из golden: 3915 вместо 3975
     let r = h.photo(TENANT, "T1", now).await;
-    assert!(r[0].text.contains("неуверенное"), "{r:?}");
-    let fix = button_starting(&r, "fix:");
-    h.tap(TENANT, &fix, now).await;
-    let r = h.say(TENANT, "3975,48", now).await;
-    h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
-    let (v, ai): (String, String) =
-        sqlx::query_as("SELECT value, ai_value FROM reading WHERE kind = 'submitted'")
-            .fetch_one(h.app.pool())
-            .await
-            .unwrap();
-    assert_eq!(v, "3975.48");
-    assert_eq!(ai, "3915,48");
-}
-
-#[tokio::test]
-async fn ai_register_mistake_is_fixed_with_the_register_picker_and_t1_t2_stay_apart() {
-    let h = H::ready().await;
-    let now = at(2026, 7, 25);
-    // на фото T2, а ИИ решил, что T1
-    h.ocr.push(Ok(vec![cand("t1", "1179", "medium")]));
-    let r = h.photo(TENANT, "R1", now).await;
-    let r = h.tap(TENANT, &button_starting(&r, "chg:"), now).await;
-    let r = h.tap(TENANT, &button_ending(&r, ":t2"), now).await;
     assert!(
-        r[0].text.contains("T2") && r[0].text.contains("1179"),
+        all_text(&r).contains("Распознано: Электричество T1 = 3915,48"),
         "{r:?}"
     );
-    h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT g.code, r.value FROM reading r JOIN register g ON g.id = r.register_id WHERE r.kind = 'submitted'",
+    for v in ["755", "417", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    // сводка показывает значение с пометкой «сверьте с фото»
+    let r = h.tap(TENANT, "ed:t1", now).await;
+    assert!(all_text(&r).contains("Электричество T1"), "{r:?}");
+    let r = h.say(TENANT, "3975,48", now).await;
+    assert!(all_text(&r).contains("Электричество T1: 3975,48"), "{r:?}");
+    h.tap(TENANT, "send", now).await;
+    let (v, ai): (String, String) = sqlx::query_as(
+        "SELECT value, ai_value FROM reading WHERE kind = 'submitted' AND source = 'photo'",
     )
-    .fetch_all(h.app.pool())
+    .fetch_one(h.app.pool())
     .await
     .unwrap();
-    assert_eq!(rows, vec![("t2".to_string(), "1179".to_string())]);
+    assert_eq!(v, "3975.48");
+    assert_eq!(ai, "3915,48", "исходное предложение ИИ сохранено");
 }
 
 #[tokio::test]
-async fn discarded_card_stores_nothing() {
+async fn low_confidence_photo_value_is_flagged_on_the_summary() {
     let h = H::ready().await;
     let now = at(2026, 7, 25);
-    h.ocr.push(Ok(vec![cand("cold", "755", "high")]));
-    let r = h.photo(TENANT, "D1", now).await;
-    h.tap(TENANT, &button_starting(&r, "no:"), now).await;
-    assert_eq!(
-        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
-            .await,
-        0
-    );
-    let r = h.tap(TENANT, &button_starting(&r, "ok:"), now).await;
+    h.ocr.push(Ok(vec![cand("cold", "755", "low")]));
+    h.photo(TENANT, "L1", now).await;
+    for v in ["417", "3975"] {
+        h.say(TENANT, v, now).await;
+    }
+    let r = h.say(TENANT, "1179", now).await;
+    assert!(all_text(&r).contains("📷⚠️ сверьте с фото"), "{r:?}");
+}
+
+#[tokio::test]
+async fn ai_register_mistake_is_caught_by_the_previous_reading_check() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    // на фото T2 (1179), а ИИ решил, что T1 — но это меньше прошлого T1 (3831), значение не принимается
+    h.ocr.push(Ok(vec![cand("t1", "1179", "medium")]));
+    let r = h.photo(TENANT, "R1", now).await;
+    let text = all_text(&r);
     assert!(
-        r[0].text.contains("Уже подтверждено") || r[0].text.contains("обработана"),
+        text.contains("меньше прошлого") && text.contains("Не принято"),
+        "{text}"
+    );
+    assert_eq!(h.drafts().await, 0, "неверное значение не сохраняется");
+    assert!(
+        text.contains("Шаг 1 из 4"),
+        "дальше — ручной ввод по шагам: {text}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_register_from_ai_asks_for_manual_entry() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.ocr.push(Ok(vec![Candidate {
+        register: None,
+        value: Some("1179".into()),
+        confidence: "low".into(),
+    }]));
+    let r = h.photo(TENANT, "U1", now).await;
+    assert!(
+        all_text(&r).contains("не удалось надёжно определить"),
         "{r:?}"
     );
-    assert_eq!(
-        h.count("SELECT count(*) FROM reading WHERE kind = 'submitted'")
-            .await,
-        0
-    );
+    assert_eq!(h.drafts().await, 0);
 }
 
 #[tokio::test]
 async fn readings_of_an_unfinished_month_are_not_mixed_with_the_next_one() {
     let h = H::ready().await;
-    // в июле принято только ХВС
-    h.enter(TENANT, "cold", "755", at(2026, 7, 28)).await;
+    h.say(TENANT, "/enter", at(2026, 7, 28)).await;
+    h.say(TENANT, "755", at(2026, 7, 28)).await;
+    h.say(TENANT, "417", at(2026, 7, 28)).await;
     // в августе арендатор продолжает тот же (июльский) период, а не открывает новый
     let r = h.say(TENANT, "/readings", at(2026, 8, 2)).await;
-    assert!(r[0].text.contains("Период 2026-07"), "{r:?}");
-    for (code, v) in [("hot", "417"), ("t1", "3975"), ("t2", "1179")] {
-        h.enter(TENANT, code, v, at(2026, 8, 2)).await;
-    }
+    assert!(
+        r[0].text.contains("Период 2026-07") && r[0].text.contains("Черновик"),
+        "{r:?}"
+    );
+    let r = h.say(TENANT, "/enter", at(2026, 8, 2)).await;
+    assert!(
+        all_text(&r).contains("Продолжаем") && all_text(&r).contains("Шаг 3 из 4"),
+        "{r:?}"
+    );
+    h.say(TENANT, "3975", at(2026, 8, 2)).await;
+    h.say(TENANT, "1179", at(2026, 8, 2)).await;
+    h.tap(TENANT, "send", at(2026, 8, 2)).await;
     assert_eq!(
         h.count("SELECT count(*) FROM bill WHERE period = '2026-07'")
             .await,
@@ -743,5 +1088,15 @@ async fn readings_of_an_unfinished_month_are_not_mixed_with_the_next_one() {
         h.count("SELECT count(*) FROM bill WHERE period = '2026-08'")
             .await,
         0
+    );
+}
+
+#[tokio::test]
+async fn stale_buttons_from_the_old_card_flow_explain_what_to_do() {
+    let h = H::ready().await;
+    let r = h.tap(TENANT, "ok:1", at(2026, 7, 25)).await;
+    assert!(
+        r[0].text.contains("устарела") && r[0].text.contains("/enter"),
+        "{r:?}"
     );
 }

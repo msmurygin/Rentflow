@@ -122,7 +122,11 @@ impl App {
         .await?;
         Ok(vec![Reply::text(
             from.chat_id,
-            format!("Настройка объекта. /cancel — отмена.\n\n{}", STEPS[0].1),
+            format!(
+                "Настройка объекта: {n} вопросов. /cancel — отмена.\n\n(1/{n}) {}",
+                STEPS[0].1,
+                n = STEPS.len()
+            ),
         )])
     }
 
@@ -131,8 +135,11 @@ impl App {
         from: &Sender,
         _u: &UserRow,
         text: &str,
-        _now: NaiveDateTime,
+        now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
+        if let Some(State::Tariff { .. }) = self.state(from.telegram_id).await? {
+            return self.tariff_text(from, text, now).await;
+        }
         let Some(State::Setup { step, mut answers }) = self.state(from.telegram_id).await? else {
             return Ok(vec![Reply::text(
                 from.chat_id,
@@ -149,7 +156,7 @@ impl App {
         answers.push(value);
         if step + 1 < STEPS.len() {
             let next = step + 1;
-            let prompt = STEPS[next].1.to_string();
+            let prompt = format!("({}/{}) {}", next + 1, STEPS.len(), STEPS[next].1);
             self.set_state(
                 from.telegram_id,
                 &State::Setup {
@@ -373,18 +380,21 @@ impl App {
         .await?;
         tx.commit().await?;
         Ok(vec![
-            Reply::text(
+            Reply::with_buttons(
                 from.chat_id,
                 format!(
-                    "Вы подключены к объекту «{name}».\n\nКаждый месяц отправляйте фото счётчиков: холодная вода, горячая вода и электричество (T1 и T2). \
-                     Бот покажет распознанное значение — проверьте его и подтвердите. Если фото не читается, нажмите /enter и введите показание вручную.\n\
-                     /readings — что уже принято.{}",
+                    "Вы подключены к объекту «{name}».\n\nКак отправить показания (раз в месяц):\n\
+                     1) нажмите «Ввести показания» (или /enter) и вводите числа по шагам: ХВС → ГВС → T1 → T2;\n\
+                     2) в конце проверьте сводку и нажмите «Отправить».\n\
+                     Вместо ввода можно прислать фото счётчика — я прочитаю цифры, а вы проверите их на сводке.\n\
+                     /readings — что уже введено, /cancel — отмена.{}",
                     if self.cfg.ocr_enabled {
                         "\n\nПриватность: чтобы прочитать цифры, фото счётчиков передаются во внешний сервис распознавания. Присылайте только фото самих счётчиков."
                     } else {
                         ""
                     }
                 ),
+                vec![vec![("▶️ Ввести показания", "enter".into())]],
             ),
             Reply::text(
                 landlord_chat,
@@ -404,6 +414,9 @@ impl App {
             return user_err("Сначала настройте объект: /setup");
         };
         let args: Vec<&str> = text.split_whitespace().skip(1).collect();
+        if args.is_empty() {
+            return self.tariff_start(from, now).await;
+        }
         let usage = "Формат: /tariff <код> <цена> <дата начала>, например:\n/tariff cold 66.87 2026-08-01\nКоды: cold, hot, sewer, t1, t2. Водоотведение выключается так: /tariff sewer off";
         let code = args.first().copied().unwrap_or("");
         if !matches!(code, "cold" | "hot" | "sewer" | "t1" | "t2") {

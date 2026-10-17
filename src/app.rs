@@ -122,8 +122,15 @@ pub enum Who {
 pub enum State {
     /// Мастер настройки: номер шага и ответы.
     Setup { step: usize, answers: Vec<String> },
-    /// Ждём число для показания `pending_id`.
-    AwaitValue { pending_id: i64 },
+    /// Форма ввода показаний: ждём число для регистра `code`. `edit` — правка одного значения из итоговой сводки
+    /// (после ввода возвращаемся к сводке), иначе идём к следующему незаполненному регистру.
+    Entry { code: String, edit: bool },
+    /// Меню тарифов: выбрана ли дата, номер шага и ответы (`keep` | `off` | цена).
+    Tariff {
+        date: Option<String>,
+        step: usize,
+        answers: Vec<String>,
+    },
 }
 
 pub fn now_iso(now: NaiveDateTime) -> String {
@@ -308,7 +315,7 @@ impl App {
                 /setup — настроить объект, арендатора, стартовые показания и тарифы\n\
                 /invite — одноразовая ссылка для арендатора\n\
                 /status — показания и счета текущего периода\n\
-                /tariff <код> <цена> <дата> — новый тариф (коды: cold hot sewer t1 t2), например /tariff cold 66.87 2026-08-01\n\
+                /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
                 /calc — пересчитать период, когда все показания уже приняты\n\
@@ -362,7 +369,7 @@ impl App {
                 _ => self.landlord_text(from, u, text, now).await,
             },
             Who::Tenant(u) => match cmd {
-                "/enter" => self.tenant_enter(from, u, now).await,
+                "/enter" => self.entry_start(from, u, now).await,
                 "/readings" => self.tenant_readings(from, u, now).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),
                 _ => self.tenant_text(from, u, text, now).await,
@@ -380,7 +387,6 @@ impl App {
         let mut parts = data.split(':');
         let kind = parts.next().unwrap_or("");
         let a = parts.next();
-        let b = parts.next();
         let id = a.and_then(|s| s.parse::<i64>().ok());
         match (who, kind) {
             (Who::Stranger, _) => Ok(vec![self.stranger(from)]),
@@ -392,14 +398,25 @@ impl App {
             (Who::Landlord(_), "ap") => self.bill_approve(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rj") => self.bill_reject(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "pd") => self.bill_paid(from, id.unwrap_or(0), now).await,
-            (Who::Tenant(u), "ok") => self.pending_confirm(from, u, id.unwrap_or(0), now).await,
-            (Who::Tenant(u), "fix") => self.pending_fix(from, u, id.unwrap_or(0)).await,
-            (Who::Tenant(u), "chg") => self.pending_pick_register(from, u, id.unwrap_or(0)).await,
-            (Who::Tenant(u), "r") => {
-                self.pending_set_register(from, u, id.unwrap_or(0), b.unwrap_or(""))
-                    .await
+            (Who::Landlord(_), "td") => self.tariff_date(from, a.unwrap_or(""), now).await,
+            (Who::Landlord(_), "tk") => self.tariff_answer(from, "keep", now).await,
+            (Who::Landlord(_), "toff") => self.tariff_answer(from, "off", now).await,
+            (Who::Landlord(_), "ts") => self.tariff_save(from, now).await,
+            (Who::Landlord(_), "tx") => {
+                self.clear_state(from.telegram_id).await?;
+                Ok(vec![Reply::text(
+                    from.chat_id,
+                    "Ввод тарифов отменён, ничего не изменилось.",
+                )])
             }
-            (Who::Tenant(u), "no") => self.pending_discard(from, u, id.unwrap_or(0)).await,
+            (Who::Tenant(u), "enter") => self.entry_start(from, u, now).await,
+            (Who::Tenant(u), "ed") => self.entry_edit(from, u, a.unwrap_or(""), now).await,
+            (Who::Tenant(u), "send") => self.entry_submit(from, u, now).await,
+            (Who::Tenant(u), "cx") => self.entry_cancel(from, u, now).await,
+            // кнопки из старой версии бота
+            (Who::Tenant(_), "ok" | "fix" | "chg" | "r" | "no") => {
+                user_err("Эта кнопка устарела. Нажмите /enter — ввод теперь идёт по шагам.")
+            }
             _ => user_err("Это действие вам недоступно."),
         }
     }

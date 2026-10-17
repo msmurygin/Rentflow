@@ -8,4 +8,5 @@ pub mod db;
 pub mod ocr;
 pub mod readings;
 pub mod setup;
+pub mod tariffs;
 pub mod util;
