@@ -195,13 +195,14 @@ pub async fn calculate_draft(
     .bind(period_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((id, version, status, old)) = &last {
-        if status == "draft" && old == &snapshot {
-            return Ok(DraftOutcome::Unchanged {
-                bill_id: *id,
-                version: *version,
-            });
-        }
+    if let Some((id, version, status, old)) = &last
+        && status == "draft"
+        && old == &snapshot
+    {
+        return Ok(DraftOutcome::Unchanged {
+            bill_id: *id,
+            version: *version,
+        });
     }
     // Прежний черновик заменяется новой версией (история остаётся).
     sqlx::query(
