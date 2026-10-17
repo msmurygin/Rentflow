@@ -153,6 +153,7 @@ pub async fn calculate_draft(
         inputs.push(MeterInput {
             meter_id: label.clone(),
             kind: kind_of(kind),
+            precision: crate::billing::ReadingPrecision::Exact,
             previous: prev.as_ref().map(|p| p.1),
             current: curr.as_ref().map(|c| c.1),
             tariff,

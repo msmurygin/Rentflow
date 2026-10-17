@@ -1,0 +1,190 @@
+{
+  "dataset_id": "RF-GOLD-001",
+  "version": "1.0",
+  "scope": "Moscow apartment 2026 July-August-September",
+  "basis": "handwritten calculations with meter photo cross-check",
+  "billing_policy": {
+    "reading_quantization": "floor_each_cumulative_reading_before_subtracting",
+    "sewer_volume": "cold_usage_plus_hot_usage",
+    "currency": "RUB",
+    "money_arithmetic": "decimal_2dp",
+    "tariff_selection": "explicit_monthly_snapshot"
+  },
+  "baseline": {
+    "period": "2026-06",
+    "reading_date": "UNKNOWN (June; day 25 not verified)",
+    "readings_integer": {
+      "cold": 753,
+      "hot": 416,
+      "t1": 3831,
+      "t2": 1118
+    }
+  },
+  "billing_periods": [
+    {
+      "period": "2026-07",
+      "period_label": "июль",
+      "readings_integer": {
+        "cold": {
+          "previous": 753,
+          "current": 755,
+          "usage": 2
+        },
+        "hot": {
+          "previous": 416,
+          "current": 417,
+          "usage": 1
+        },
+        "t1": {
+          "previous": 3831,
+          "current": 3975,
+          "usage": 144
+        },
+        "t2": {
+          "previous": 1118,
+          "current": 1179,
+          "usage": 61
+        }
+      },
+      "derived_usage": {
+        "sewer": 3
+      },
+      "tariffs_rub_per_unit": {
+        "cold": "65.77",
+        "hot": "312.50",
+        "sewer": "51.62",
+        "t1": "8.60",
+        "t2": "3.71"
+      },
+      "lines_rub": {
+        "cold": "131.54",
+        "hot": "312.50",
+        "sewer": "154.86",
+        "t1": "1238.40",
+        "t2": "226.31"
+      },
+      "water_rub": "598.90",
+      "electricity_rub": "1464.71",
+      "expected_total_rub": "2063.61",
+      "status": "verified_arithmetic_from_handwritten_sources"
+    },
+    {
+      "period": "2026-08",
+      "period_label": "август",
+      "readings_integer": {
+        "cold": {
+          "previous": 755,
+          "current": 759,
+          "usage": 4
+        },
+        "hot": {
+          "previous": 417,
+          "current": 419,
+          "usage": 2
+        },
+        "t1": {
+          "previous": 3975,
+          "current": 4102,
+          "usage": 127
+        },
+        "t2": {
+          "previous": 1179,
+          "current": 1222,
+          "usage": 43
+        }
+      },
+      "derived_usage": {
+        "sewer": 6
+      },
+      "tariffs_rub_per_unit": {
+        "cold": "66.87",
+        "hot": "317.71",
+        "sewer": "52.48",
+        "t1": "8.60",
+        "t2": "3.71"
+      },
+      "lines_rub": {
+        "cold": "267.48",
+        "hot": "635.42",
+        "sewer": "314.88",
+        "t1": "1092.20",
+        "t2": "159.53"
+      },
+      "water_rub": "1217.78",
+      "electricity_rub": "1251.73",
+      "expected_total_rub": "2469.51",
+      "status": "verified_arithmetic_from_handwritten_sources"
+    },
+    {
+      "period": "2026-09",
+      "period_label": "сентябрь",
+      "readings_integer": {
+        "cold": {
+          "previous": 759,
+          "current": 761,
+          "usage": 2
+        },
+        "hot": {
+          "previous": 419,
+          "current": 420,
+          "usage": 1
+        },
+        "t1": {
+          "previous": 4102,
+          "current": 4250,
+          "usage": 148
+        },
+        "t2": {
+          "previous": 1222,
+          "current": 1282,
+          "usage": 60
+        }
+      },
+      "derived_usage": {
+        "sewer": 3
+      },
+      "tariffs_rub_per_unit": {
+        "cold": "66.87",
+        "hot": "317.71",
+        "sewer": "52.48",
+        "t1": "8.60",
+        "t2": "3.71"
+      },
+      "lines_rub": {
+        "cold": "133.74",
+        "hot": "317.71",
+        "sewer": "157.44",
+        "t1": "1272.80",
+        "t2": "222.60"
+      },
+      "water_rub": "608.89",
+      "electricity_rub": "1495.40",
+      "expected_total_rub": "2104.29",
+      "status": "verified_arithmetic_from_handwritten_sources"
+    }
+  ],
+  "known_discrepancies": [
+    {
+      "period": "2026-09",
+      "field": "handwritten_final_total",
+      "written_rub": "2104.39",
+      "calculated_rub": "2104.29",
+      "difference_rub": "0.10",
+      "expected_behavior": "flag discrepancy; do not silently accept handwritten amount"
+    },
+    {
+      "period": "2026-07",
+      "field": "electricity_T1_photo",
+      "incorrect_prior_OCR": "3915.48",
+      "correct_photo_reading": "3975.48",
+      "expected_behavior": "reject inconsistent OCR against original image and manual record"
+    }
+  ],
+  "constraints": [
+    "Month assignment grounded by handwritten sheets; initial readings are June, exact date is not confirmed",
+    "July/August/September likely measured near the 25th based on owner statement; retain source dates per upload instead of inventing timestamps",
+    "Historical handwritten data uses whole-unit readings; not universal rule",
+    "Water drainage/sewer charge included in the handwritten examples; chargeability to tenant must be explicitly configured",
+    "Exact decimal wheel readings are not all verified, so golden billing uses integer digits only"
+  ]
+}

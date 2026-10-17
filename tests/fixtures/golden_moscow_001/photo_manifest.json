@@ -1,0 +1,114 @@
+[
+  {
+    "filename": "1000008117.jpg",
+    "register": "cold",
+    "proposed_month": "2026-06",
+    "integer_reading": 753,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008114.jpg",
+    "register": "cold",
+    "proposed_month": "2026-07",
+    "integer_reading": 755,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008109.jpg",
+    "register": "cold",
+    "proposed_month": "2026-08",
+    "integer_reading": 759,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008105.jpg",
+    "register": "cold",
+    "proposed_month": "2026-09",
+    "integer_reading": 761,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008116.jpg",
+    "register": "hot",
+    "proposed_month": "2026-06",
+    "integer_reading": 416,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008112.jpg",
+    "register": "hot",
+    "proposed_month": "2026-07",
+    "integer_reading": 417,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008108.jpg",
+    "register": "hot",
+    "proposed_month": "2026-08",
+    "integer_reading": 419,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008104.jpg",
+    "register": "hot",
+    "proposed_month": "2026-09",
+    "integer_reading": 420,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008118.jpg",
+    "register": "t1",
+    "proposed_month": "2026-06",
+    "integer_reading": 3831,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008115.jpg",
+    "register": "t1",
+    "proposed_month": "2026-07",
+    "integer_reading": 3975,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008110.jpg",
+    "register": "t1",
+    "proposed_month": "2026-08",
+    "integer_reading": 4102,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008106.jpg",
+    "register": "t1",
+    "proposed_month": "2026-09",
+    "integer_reading": 4250,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008119.jpg",
+    "register": "t2",
+    "proposed_month": "2026-06",
+    "integer_reading": 1118,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008113.jpg",
+    "register": "t2",
+    "proposed_month": "2026-07",
+    "integer_reading": 1179,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008111.jpg",
+    "register": "t2",
+    "proposed_month": "2026-08",
+    "integer_reading": 1222,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  },
+  {
+    "filename": "1000008107.jpg",
+    "register": "t2",
+    "proposed_month": "2026-09",
+    "integer_reading": 1282,
+    "assignment": "proposed_by_meter_trend_and_handwritten_sheet; verify source date"
+  }
+]
