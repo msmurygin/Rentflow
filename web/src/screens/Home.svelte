@@ -6,10 +6,10 @@
   import { dateLong, money, monthName } from '../lib/format';
   import { t } from '../lib/i18n';
   import { loader } from '../lib/load.svelte';
-  import { go, session } from '../lib/store.svelte';
+  import { currentRole, go } from '../lib/store.svelte';
   import type { BillSummary, Home } from '../lib/types';
 
-  const landlord = $derived(session.me?.role === 'landlord');
+  const landlord = $derived(currentRole() === 'landlord');
   const l = loader(async () => {
     const [home, bills] = await Promise.all([api.get<Home>('/home'), api.get<{ bills: BillSummary[] }>('/bills')]);
     return { home, bills: bills.bills };
@@ -85,6 +85,29 @@
             {:else}{landlord ? t('home.readingsProgress', { n: home.received ?? 0, total: home.total_registers ?? 4 }) : t('home.dueNow')}{/if}
           </p>
         </Card>
+
+        {#if landlord}
+          {@const steps = [
+            { text: t('first.property'), done: true, to: 'property' as const },
+            { text: t('first.invite'), done: home.property.tenant_connected, to: 'property' as const },
+            { text: t('first.readings'), done: (home.received ?? 0) > 0 || d.bills.length > 0, to: 'readings' as const },
+            { text: t('first.bill'), done: d.bills.some((b) => b.status === 'approved' || b.status === 'paid'), to: 'bills' as const },
+          ]}
+          {#if steps.some((x) => !x.done)}
+            <Card>
+              <div class="mb-2 flex items-center justify-between">
+                <h2 class="font-semibold">{t('first.title')}</h2>
+                <span class="num text-sm text-muted">{steps.filter((x) => x.done).length}/{steps.length}</span>
+              </div>
+              {#each steps as st (st.text)}
+                <button class="flex w-full items-center gap-3 border-t border-line py-3 text-left first:border-t-0" onclick={() => go(st.to)}>
+                  <span class="grid size-6 place-items-center rounded-full text-xs {st.done ? 'bg-ok text-white' : 'border border-line text-muted'}">{st.done ? '✓' : ''}</span>
+                  <span class={st.done ? 'text-muted line-through' : ''}>{st.text}</span>
+                </button>
+              {/each}
+            </Card>
+          {/if}
+        {/if}
 
         <Card>
           <h2 class="mb-2 font-semibold">{t('home.actions')}</h2>

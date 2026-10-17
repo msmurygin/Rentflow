@@ -11,10 +11,17 @@ export class ApiError extends Error {
 }
 
 let token: string | null = null;
+let propertyId: number | null = null;
+// запросы, которые не привязаны к выбранной квартире (вход, регистрация, мастер новой квартиры, приглашение)
+const UNSCOPED = ['/auth', '/me', '/register', '/setup', '/properties', '/invitations/accept'];
 let reauth: (() => Promise<void>) | null = null;
 
 export function setToken(t: string | null) {
   token = t;
+}
+/** Выбранная квартира: сервер проверяет, что пользователь в ней участник (иначе 404). */
+export function setProperty(id: number | null) {
+  propertyId = id;
 }
 export function onReauth(fn: () => Promise<void>) {
   reauth = fn;
@@ -23,6 +30,7 @@ export function onReauth(fn: () => Promise<void>) {
 async function raw(method: string, path: string, body?: BodyInit, headers: Record<string, string> = {}): Promise<Response> {
   const h: Record<string, string> = { ...headers };
   if (token) h['Authorization'] = `Bearer ${token}`;
+  if (propertyId !== null && !UNSCOPED.some((p) => path.startsWith(p))) h['X-Property-Id'] = String(propertyId);
   try {
     return await fetch(`/api${path}`, { method, body, headers: h });
   } catch {

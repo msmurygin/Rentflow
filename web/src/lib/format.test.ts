@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addMonth, dateLong, isValidNumber, money, monthFrom, monthName, num, price, usage } from './format';
+import { addMonth, dateLong, isValidNumber, money, monthFrom, monthName, num, price, tokenFrom, usage } from './format';
 
 describe('format', () => {
   it('formats money from decimal strings without floats', () => {
@@ -32,6 +32,12 @@ describe('format', () => {
     expect(usage('10', '')).toBe('—');
     expect(usage('abc', '1')).toBe('—');
     expect(usage('1e5', '1')).toBe('—');
+  });
+  it('extracts invitation tokens from links', () => {
+    expect(tokenFrom('https://t.me/rentaflow_bot?start=abc123DEF')).toBe('abc123DEF');
+    expect(tokenFrom('https://t.me/bot/app?startapp=xyz_9')).toBe('xyz_9');
+    expect(tokenFrom('  abc123  ')).toBe('abc123');
+    expect(tokenFrom('')).toBe('');
   });
   it('validates typed numbers', () => {
     expect(isValidNumber('761,5')).toBe(true);

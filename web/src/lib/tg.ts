@@ -28,6 +28,10 @@ export const tg = {
   get initData() {
     return wa()?.initData ?? '';
   },
+  /** Параметр запуска (`startapp=`): так владелец может прислать приглашение прямо в приложение. */
+  get startParam(): string {
+    return new URLSearchParams(wa()?.initData ?? '').get('start_param') ?? '';
+  },
   init() {
     const w = wa();
     if (!w) return;

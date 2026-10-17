@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t, type Key } from '../lib/i18n';
-  import { go, nav, session, type Tab } from '../lib/store.svelte';
+  import { currentRole, go, nav, type Tab } from '../lib/store.svelte';
 
   const icons: Record<Tab, string> = {
     home: 'M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z',
@@ -9,7 +9,7 @@
     tariffs: 'M4 7h16M4 12h16M4 17h10',
     bills: 'M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6',
   };
-  const tabs = $derived<Tab[]>(session.me?.role === 'landlord' ? ['home', 'property', 'tariffs', 'bills'] : ['home', 'readings', 'bills']);
+  const tabs = $derived<Tab[]>(currentRole() === 'landlord' ? ['home', 'property', 'tariffs', 'bills'] : ['home', 'readings', 'bills']);
 </script>
 
 <nav

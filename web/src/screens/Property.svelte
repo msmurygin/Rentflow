@@ -7,12 +7,11 @@
   import { dateLong, isValidNumber, num } from '../lib/format';
   import { t, type Key } from '../lib/i18n';
   import { loader } from '../lib/load.svelte';
-  import { notify, session } from '../lib/store.svelte';
+  import { currentRole, notify, session } from '../lib/store.svelte';
   import { tg } from '../lib/tg';
   import type { Property } from '../lib/types';
 
-  const landlord = $derived(session.me?.role === 'landlord');
-  const codes = ['cold', 'hot', 't1', 't2'] as const;
+  const landlord = $derived(currentRole() === 'landlord');
   let none = $state(false);
   const l2 = loader(async () => {
     const p = (await api.get<{ property: Property | null }>('/property')).property;
@@ -22,57 +21,12 @@
 
   let name = $state('');
   let tenant = $state('');
-  let baseDate = $state('');
-  let baselines = $state<Record<string, string>>({ cold: '', hot: '', t1: '', t2: '' });
-  let prices = $state<Record<string, string>>({ cold: '', hot: '', t1: '', t2: '' });
-  let sewerOn = $state(true);
-  let sewerPrice = $state('');
-  let proof = $state(true);
+  let readingDay = $state('');
   let errors = $state<Record<string, string>>({});
   let busy = $state(false);
 
-  let readingDay = $state('');
   let editing = $state(false);
   let invite = $state<{ url: string; ttl_days: number } | null>(null);
-
-  function validate(): boolean {
-    const e: Record<string, string> = {};
-    if (!name.trim()) e.name = 'Укажите название';
-    if (!tenant.trim()) e.tenant = 'Укажите имя арендатора';
-    for (const c of codes) {
-      if (!isValidNumber(baselines[c])) e[`b_${c}`] = 'Нужно число';
-      if (!isValidNumber(prices[c])) e[`p_${c}`] = 'Нужно число';
-    }
-    if (sewerOn && !isValidNumber(sewerPrice)) e.sewer = 'Нужно число';
-    if (readingDay.trim() && !/^([1-9]|1\d|2[0-8])$/.test(readingDay.trim())) e.readingDay = 'Число от 1 до 28';
-    errors = e;
-    return Object.keys(e).length === 0;
-  }
-
-  async function create() {
-    if (!validate()) return;
-    busy = true;
-    try {
-      await api.put('/property', {
-        name,
-        tenant_name: tenant,
-        base_date: baseDate || null,
-        baselines,
-        prices,
-        sewer_price: sewerOn ? sewerPrice : null,
-        proof_required: proof,
-        reading_day: readingDay.trim() ? Number(readingDay) : 0,
-      });
-      if (session.me) session.me.property_configured = true;
-      tg.haptic('success');
-      notify(t('save'));
-      await l2.reload();
-    } catch (e) {
-      notify(errorText(e, t('genericError'), t('offline')), 'err');
-    } finally {
-      busy = false;
-    }
-  }
 
   async function patch(body: Record<string, unknown>) {
     busy = true;
@@ -112,48 +66,7 @@
 <Async l={l2}>
   {#snippet children(p)}
     {#if none}
-      {#if landlord}
-        <div class="grid gap-3 pb-4">
-          <h1 class="text-xl font-bold">{t('property.create')}</h1>
-          <Card class="grid gap-3">
-            <Field label={t('property.name')} bind:value={name} error={errors.name} placeholder="Квартира на Тверской" />
-            <Field label={t('property.tenant')} bind:value={tenant} error={errors.tenant} />
-            <Field label={t('property.baseDate')} bind:value={baseDate} type="date" hint={t('property.baseDateHint')} />
-            <Field label={t('property.readingDay')} bind:value={readingDay} inputmode="numeric" hint={t('property.readingDayHint')} error={errors.readingDay} />
-          </Card>
-          <Card class="grid gap-3">
-            <div>
-              <h2 class="font-semibold">{t('property.baselines')}</h2>
-              <p class="text-sm text-muted">{t('property.baselinesHint')}</p>
-            </div>
-            {#each codes as c (c)}
-              <Field label={t(`reg.${c}` as Key)} bind:value={baselines[c]} inputmode="decimal" error={errors[`b_${c}`]} suffix={c.startsWith('t') ? t('unit.kwh') : t('unit.m3')} />
-            {/each}
-          </Card>
-          <Card class="grid gap-3">
-            <h2 class="font-semibold">{t('property.prices')}</h2>
-            {#each codes as c (c)}
-              <Field label={t(`reg.${c}` as Key)} bind:value={prices[c]} inputmode="decimal" error={errors[`p_${c}`]} suffix={c.startsWith('t') ? t('price.kwh') : t('price.m3')} />
-            {/each}
-            <label class="flex items-center justify-between gap-3 py-1">
-              <span>{t('property.sewer')}</span>
-              <input type="checkbox" class="size-6 accent-[var(--brand)]" bind:checked={sewerOn} />
-            </label>
-            {#if sewerOn}
-              <Field label={t('reg.sewer')} bind:value={sewerPrice} inputmode="decimal" error={errors.sewer} suffix={t('price.m3')} />
-            {/if}
-          </Card>
-          <Card>
-            <label class="flex items-center justify-between gap-3">
-              <span>{t('property.proof')}</span>
-              <input type="checkbox" class="size-6 accent-[var(--brand)]" bind:checked={proof} />
-            </label>
-          </Card>
-          <Btn {busy} onclick={create}>{t('property.create')}</Btn>
-        </div>
-      {:else}
-        <Card><p class="text-muted">{t('home.noProperty')}</p></Card>
-      {/if}
+      <Card><p class="text-muted">{t('home.noProperty')}</p></Card>
     {:else}
       <div class="grid gap-3 pb-4">
         <div class="flex items-start justify-between gap-3">

@@ -1,11 +1,18 @@
 export type Role = 'landlord' | 'tenant' | 'new';
 export type BillStatus = 'draft' | 'approved' | 'paid' | 'rejected' | 'void';
 
+export interface PropertyRef {
+  id: number;
+  name: string;
+  role: 'owner' | 'tenant';
+  active: boolean;
+}
 export interface Me {
   role: Role;
   name: string;
   bot_username: string;
   property_configured: boolean;
+  properties: PropertyRef[];
 }
 export interface Register {
   code: string;

@@ -76,3 +76,9 @@ export function monthFrom(period: string): string {
   const name = MONTHS_GEN[Number(m) - 1];
   return name ? `${name} ${y}` : period;
 }
+
+/** Из ссылки t.me/…?start=ТОКЕН (или startapp=) достаём токен приглашения; голый токен принимаем как есть. */
+export function tokenFrom(text: string): string {
+  const m = text.match(/[?&](?:start|startapp)=([A-Za-z0-9_-]+)/);
+  return (m ? m[1] : text).trim();
+}

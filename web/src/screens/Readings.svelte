@@ -9,11 +9,11 @@
   import { t, type Key } from '../lib/i18n';
   import { loader } from '../lib/load.svelte';
   import { toJpeg } from '../lib/photo';
-  import { go, notify, session } from '../lib/store.svelte';
+  import { currentRole, go, notify } from '../lib/store.svelte';
   import { tg } from '../lib/tg';
   import type { FormView, Home, MeterRow } from '../lib/types';
 
-  const landlord = $derived(session.me?.role === 'landlord');
+  const landlord = $derived(currentRole() === 'landlord');
 
   // ---- владелец: что уже передано в этом периоде ----
   const owner = loader(async () => (landlord ? await api.get<{ period: string; registers: MeterRow[] }>('/meters') : null));

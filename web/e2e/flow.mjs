@@ -19,7 +19,9 @@ async function openAs(userId, scheme = 'light') {
   if (userId === 1) {
     // владелец регистрируется сам (как в продукте): вход через Telegram + регистрация
     const t = (await (await fetch(`${BASE}/api/auth/telegram`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ init_data: initData }) })).json()).token;
-    await fetch(`${BASE}/api/register`, { method: 'POST', headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' }, body: '{}' });
+    const h = { authorization: `Bearer ${t}`, 'content-type': 'application/json' };
+    await fetch(`${BASE}/api/register`, { method: 'POST', headers: h, body: '{}' });
+    await fetch(`${BASE}/api/property`, { method: 'PUT', headers: h, body: JSON.stringify({ name: 'Квартира на Тверской', tenant_name: 'Иван', baselines: { cold: '753', hot: '416', t1: '3831', t2: '1118' }, prices: { cold: '65,77', hot: '312,50', t1: '8,60', t2: '3,71' }, sewer_price: '51,62' }) });
   }
   // настоящий telegram-web-app.js вне Telegram затёр бы заглушку — не даём ему загрузиться
   await ctx.route('**/telegram-web-app.js', (r) => r.abort());
@@ -38,24 +40,11 @@ async function openAs(userId, scheme = 'light') {
 }
 const shot = (page, name) => page.screenshot({ path: `${OUT}/${String(++step).padStart(2, '0')}-${name}.png` });
 
-// 1. владелец: пустая главная → создание квартиры
+// 1. владелец: квартира создана через API (создание через интерфейс-мастер проверяет onboarding.mjs)
 const owner = await openAs(1);
-await owner.getByText('Квартира ещё не настроена').waitFor();
-await shot(owner, 'owner-home-empty');
-await owner.getByRole('button', { name: 'Настройте квартиру →' }).click();
-await owner.getByText('Создать квартиру').first().waitFor();
-await owner.getByLabel('Название или адрес').fill('Квартира на Тверской');
-await owner.getByLabel('Арендатор', { exact: true }).fill('Иван');
-const nums = { 'Холодная вода (ХВС)': ['753', '65,77'], 'Горячая вода (ГВС)': ['416', '312,50'], 'Электричество T1': ['3831', '8,60'], 'Электричество T2': ['1118', '3,71'] };
-for (const [label, [base, price]] of Object.entries(nums)) {
-  const inputs = owner.getByLabel(label);
-  await inputs.nth(0).fill(base);
-  await inputs.nth(1).fill(price);
-}
-await owner.getByLabel('Водоотведение', { exact: false }).last().fill('51,62');
-await shot(owner, 'owner-property-form');
-await owner.getByRole('button', { name: 'Создать квартиру' }).click();
 await owner.getByText('Квартира на Тверской').first().waitFor();
+await owner.getByRole('button', { name: 'Квартира', exact: true }).click();
+await owner.getByText('Счётчики').first().waitFor();
 check(await owner.getByText('Не подключён').isVisible(), 'квартира создана, арендатор не подключён');
 await owner.getByRole('button', { name: 'Пригласить арендатора' }).click();
 const link = await owner.locator('p.break-all').innerText();
@@ -149,7 +138,7 @@ await owner.locator('div[role=dialog]').getByRole('button', { name: 'Отмет�
 await owner.getByText('Оплачен').first().waitFor();
 await shot(owner, 'owner-bill-paid');
 // 6b. расписание и аннулирование оплаченного счёта
-await owner.getByRole('button', { name: 'Квартира' }).click();
+await owner.getByRole('button', { name: 'Квартира', exact: true }).click();
 await owner.getByRole('button', { name: 'Изменить' }).click();
 await owner.getByLabel('День передачи показаний').fill('25');
 await owner.getByRole('button', { name: 'Сохранить' }).click();
