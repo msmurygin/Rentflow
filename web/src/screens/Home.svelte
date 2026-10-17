@@ -108,6 +108,7 @@
             {/each}
           </Card>
         {/if}
+        <p class="pt-2 text-center text-xs text-muted">RentFlow · сборка {__BUILD__}</p>
       </div>
     {/if}
   {/snippet}

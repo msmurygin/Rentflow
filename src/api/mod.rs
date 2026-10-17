@@ -1082,7 +1082,30 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
     if let Some(dir) = static_dir {
         use tower_http::services::{ServeDir, ServeFile};
         app = app
-            .fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html"))));
+            .fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html"))))
+            .layer(axum::middleware::from_fn(static_cache_headers));
     }
     app
+}
+
+/// Кэш клиента: страница и скрипт Telegram всегда перепроверяются (иначе после обновления человек видит старую версию),
+/// файлы `/assets/*` содержат хеш в имени и кэшируются навсегда. API и health не трогаем.
+async fn static_cache_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_owned();
+    let mut res = next.run(req).await;
+    let value = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else if path.starts_with("/api") || path == "/healthz" || path == "/readyz" {
+        return res;
+    } else {
+        "no-cache"
+    };
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        value.parse().expect("статическое значение"),
+    );
+    res
 }

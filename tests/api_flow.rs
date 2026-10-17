@@ -810,7 +810,7 @@ async fn static_frontend_and_health_are_served_without_auth() {
         TOKEN.into(),
         3,
     ));
-    let app = router(state, Some(dir));
+    let app = router(state, Some(dir.clone()));
     for path in ["/", "/healthz", "/some/client/route"] {
         let resp = app
             .clone()
@@ -819,6 +819,31 @@ async fn static_frontend_and_health_are_served_without_auth() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
     }
+    // страница не залипает в кэше клиента, файлы с хешем — кэшируются навсегда
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(dir.join("assets/app-abc123.js"), "console.log(1)").unwrap();
+    let cache = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            resp.headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+    };
+    assert_eq!(cache("/").await.as_deref(), Some("no-cache"));
+    assert_eq!(
+        cache("/telegram-web-app.js").await.as_deref(),
+        Some("no-cache")
+    );
+    assert_eq!(
+        cache("/assets/app-abc123.js").await.as_deref(),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert_eq!(cache("/healthz").await, None);
     // API по-прежнему закрыт
     let resp = app
         .oneshot(
