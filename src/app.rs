@@ -15,6 +15,8 @@ pub struct Config {
     /// Куда сохранять оригиналы фото (`None` — только ссылки Telegram).
     pub photo_dir: Option<PathBuf>,
     pub invite_ttl_days: i64,
+    /// Фото уходят во внешний ИИ-сервис распознавания — арендатору об этом сообщается.
+    pub ocr_enabled: bool,
 }
 
 pub struct App {

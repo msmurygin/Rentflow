@@ -76,6 +76,7 @@ impl H {
                 bot_username: "rentflow_bot".into(),
                 photo_dir,
                 invite_ttl_days: 7,
+                ocr_enabled: false,
             },
             ocr.clone(),
         );
