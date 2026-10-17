@@ -1,0 +1,17 @@
+# Запуск на сервере или личном компьютере:  docker compose up -d --build
+# Логи:                                      docker compose logs -f
+# Остановка:                                 docker compose down   (данные в томе сохраняются)
+services:
+  rentflow:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # внутри контейнера база и фото лежат в томе /data
+      DATABASE_URL: sqlite:///data/rentflow.db
+      PHOTO_DIR: /data/photos
+    volumes:
+      - rentflow-data:/data
+
+volumes:
+  rentflow-data:

@@ -108,7 +108,29 @@ cargo run --release           # нужен Rust 1.97+ (rust-toolchain подтя
 
 Постоянное решение — запустить бота на сервере, откуда Telegram доступен (VPS за пределами РФ).
 
-## 9. Docker
+## 9. Постоянный запуск на сервере (VPS)
+
+Подходит любой Linux-сервер за пределами фильтруемых сетей (от ~4–5 €/мес.). Нужен только Docker.
+
+```bash
+# 1. Docker (Ubuntu/Debian)
+curl -fsSL https://get.docker.com | sh
+
+# 2. Код и настройки
+git clone https://github.com/msmurygin/Rentflow.git && cd Rentflow
+cp .env.example .env
+nano .env        # TELEGRAM_BOT_TOKEN, LANDLORD_TELEGRAM_ID, при желании ANTHROPIC_API_KEY
+
+# 3. Запуск (перезапускается сам после сбоя и перезагрузки сервера)
+docker compose up -d --build
+docker compose logs -f      # должно быть: "bot started bot_username=..."
+```
+
+Обновление: `git pull && docker compose up -d --build`. Данные (SQLite и фото) лежат в томе `rentflow-data` и
+переживают обновления. Перенос существующей базы: скопируйте `data/rentflow.db` в том (бот остановлен).
+Запускайте **один** экземпляр на токен — второй (например, забытый на ноутбуке) вызовет конфликты.
+
+## 9a. Docker вручную
 
 ```bash
 docker build -t rentflow .
