@@ -102,7 +102,50 @@
     }
   }
 
-  const ready = (f: FormView) => f.complete && f.registers.every((r) => !errors[r.code]);
+  const shown = (v: string) => v.replace(/\.0+$/, '').replace('.', ',');
+
+  /** Что мешает отправке: считаем по тому, что человек видит на экране, а не по ответу сервера. */
+  function problems(f: FormView): { code: string; label: string; what: string }[] {
+    const out: { code: string; label: string; what: string }[] = [];
+    for (const r of f.registers) {
+      const typed = (values[r.code] ?? '').trim();
+      let what = '';
+      if (!typed) what = t('readings.needValue');
+      else if (!isValidNumber(typed) || errors[r.code]) what = errors[r.code] || t('readings.needNumber');
+      else if (f.proof_required && !r.has_photo) what = t('readings.photoRequired');
+      if (what) out.push({ code: r.code, label: t(`reg.${r.code}` as Key), what });
+    }
+    return out;
+  }
+
+  /** Сохраняет введённые, но ещё не сохранённые числа: поле сохраняется при уходе из него, а тап по кнопке мог прийти раньше. */
+  async function commitPending(f: FormView) {
+    for (const r of f.registers) {
+      const typed = (values[r.code] ?? '').trim();
+      if (typed && isValidNumber(typed) && typed !== shown(r.value ?? '')) await commit(r.code);
+    }
+  }
+
+  let checking = $state(false);
+  async function review() {
+    if (checking || !form.data) return;
+    checking = true;
+    try {
+      await commitPending(form.data);
+      const f = form.data;
+      const bad = problems(f);
+      if (bad.length) {
+        for (const b of bad) if (!errors[b.code]) errors[b.code] = b.what;
+        notify(`${t('readings.missing')}: ${bad.map((b) => `${b.label} — ${b.what}`).join('; ')}`, 'err');
+        tg.haptic('error');
+        document.getElementById(`reg-${bad[0].code}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        return;
+      }
+      summary = true;
+    } finally {
+      checking = false;
+    }
+  }
 </script>
 
 {#if landlord}
@@ -158,6 +201,7 @@
           </div>
 
           {#each f.registers as r (r.code)}
+            <div id="reg-{r.code}"></div>
             <Card class="grid gap-3">
               <div class="flex items-start justify-between gap-2">
                 <div>
@@ -203,7 +247,7 @@
 
         <div class="fixed inset-x-0 bottom-[calc(4.25rem+env(safe-area-inset-bottom))] z-20 border-t border-line bg-bg/95 p-3 backdrop-blur">
           <div class="mx-auto max-w-xl">
-            <Btn disabled={!ready(f)} onclick={() => (summary = true)}>{ready(f) ? t('readings.review') : t('readings.incomplete')}</Btn>
+            <Btn busy={checking} onclick={review}>{t('readings.review')}</Btn>
           </div>
         </div>
 
