@@ -37,6 +37,20 @@ pub async fn approve_bill(
 ) -> Result<ApproveOutcome, ApprovalError> {
     let mut tx = pool.begin().await?;
 
+    // Порядок блокировок везде один: период → счёт (как в calculate_draft), иначе возможна
+    // взаимная блокировка с параллельным пересчётом.
+    let period_locked: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT bp.id FROM billing_period bp
+          WHERE bp.id = (SELECT billing_period_id FROM bill WHERE id = $1)
+          FOR UPDATE",
+    )
+    .bind(bill_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if period_locked.is_none() {
+        return Err(ApprovalError::NotFound);
+    }
+
     // FOR UPDATE: второй параллельный approve ждёт здесь и затем видит уже утверждённый счёт.
     let bill: Option<(String, Uuid, rust_decimal::Decimal, String)> = sqlx::query_as(
         "SELECT b.status, p.id, b.total, b.currency::text
