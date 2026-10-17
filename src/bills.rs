@@ -28,6 +28,9 @@ pub struct Snapshot {
     pub currency: String,
     pub total: String,
     pub policy: String,
+    /// Явные решения владельца (например, какой тариф применён при смене цены внутри периода).
+    #[serde(default)]
+    pub note: Option<String>,
     pub lines: Vec<SnapLine>,
 }
 
@@ -65,37 +68,166 @@ fn kind_of(code: &str) -> MeterKind {
     }
 }
 
+/// Как поступить, если цена позиции менялась внутри расчётного периода.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TariffPolicy {
+    /// Не считать, пока владелец не решит (по умолчанию).
+    Strict,
+    /// Решение владельца: для всего периода взять новую цену.
+    NewForWholePeriod,
+    /// Решение владельца: для всего периода взять прежнюю цену.
+    OldForWholePeriod,
+}
+
+/// Цена менялась внутри периода: была `old`, стала `new` с даты `from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TariffSplit {
+    pub old: Decimal,
+    pub new: Decimal,
+    pub from: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickError {
+    Missing,
+    Split(TariffSplit),
+}
+
+/// Выбор цены за период `[start, end]` (ISO-даты) из версий тарифа по возрастанию даты начала.
+///
+/// * Действует последняя версия, начавшаяся не позже начала периода; если такой нет, то самая первая версия:
+///   до неё тарифа не существовало, делить нечего (первый тариф, заведённый посреди месяца, — не «смена»).
+/// * Сменой считается только версия внутри периода с **другой** ценой; версия с той же ценой ничего не меняет.
+pub fn pick_tariff(
+    versions: &[(String, Decimal)],
+    start: &str,
+    end: &str,
+    policy: TariffPolicy,
+) -> Result<(Decimal, Option<TariffSplit>), PickError> {
+    if versions.is_empty() {
+        return Err(PickError::Missing);
+    }
+    let base = versions
+        .iter()
+        .rposition(|v| v.0.as_str() <= start)
+        .unwrap_or(0);
+    let old = versions[base].1;
+    let mut current = old;
+    let mut split: Option<TariffSplit> = None;
+    for (date, price) in &versions[base + 1..] {
+        if date.as_str() > end {
+            break;
+        }
+        if *price != current {
+            split = Some(match split {
+                None => TariffSplit {
+                    old,
+                    new: *price,
+                    from: date.clone(),
+                },
+                Some(s) => TariffSplit { new: *price, ..s },
+            });
+            current = *price;
+        }
+    }
+    match (split, policy) {
+        (None, _) => Ok((old, None)),
+        (Some(s), TariffPolicy::Strict) => Err(PickError::Split(s)),
+        (Some(s), TariffPolicy::NewForWholePeriod) => Ok((s.new, Some(s))),
+        (Some(s), TariffPolicy::OldForWholePeriod) => Ok((old, Some(s))),
+    }
+}
+
 impl App {
-    /// Цена тарифа, действующая в расчётном периоде. Смена внутри периода — отказ, а не молчаливый выбор.
+    /// Цена тарифа, действующая в расчётном периоде (см. `pick_tariff`). Реальная смена цены внутри периода без явного
+    /// решения владельца — отказ, а не молчаливый выбор; решение владельца записывается в `notes` и попадает в счёт.
     async fn tariff_for(
         &self,
         property_id: i64,
         code: &str,
         period: &str,
+        policy: TariffPolicy,
+        notes: &mut Vec<String>,
     ) -> Res<Result<Decimal, BillingError>> {
         let (first, last) =
             period_bounds(period).ok_or_else(|| AppError::User("Некорректный период.".into()))?;
-        let changed: i64 = sqlx::query_scalar("SELECT count(*) FROM tariff WHERE property_id = ? AND code = ? AND valid_from > ? AND valid_from <= ?")
+        let versions = self.tariff_versions(property_id, code).await?;
+        Ok(
+            match pick_tariff(&versions, &first.to_string(), &last.to_string(), policy) {
+                Ok((price, split)) => {
+                    if let Some(s) = split {
+                        notes.push(format!(
+                        "{}: в периоде менялась цена ({} → {} ₽ с {}); по решению владельца для всего периода применён {} тариф ({} ₽)",
+                        label(code),
+                        money(s.old),
+                        money(s.new),
+                        s.from,
+                        if policy == TariffPolicy::NewForWholePeriod { "новый" } else { "прежний" },
+                        money(price)
+                    ));
+                    }
+                    Ok(price)
+                }
+                Err(PickError::Missing) => Err(BillingError::MissingTariff(code.into())),
+                Err(PickError::Split(_)) => Err(BillingError::TariffChangedInPeriod(code.into())),
+            },
+        )
+    }
+
+    /// Версии тарифа позиции по возрастанию даты начала.
+    pub(crate) async fn tariff_versions(
+        &self,
+        property_id: i64,
+        code: &str,
+    ) -> Res<Vec<(String, Decimal)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT valid_from, price FROM tariff WHERE property_id = ? AND code = ? ORDER BY valid_from ASC",
+        )
+        .bind(property_id)
+        .bind(code)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(d, p)| Some((d, p.parse().ok()?)))
+            .collect())
+    }
+
+    /// Позиции, у которых цена реально менялась внутри периода: «ХВС: 50,00 → 52,00 ₽ с 2026-10-15».
+    pub(crate) async fn tariff_conflicts(
+        &self,
+        property_id: i64,
+        period: &str,
+    ) -> Res<Vec<String>> {
+        let Some((first, last)) = period_bounds(period) else {
+            return Ok(vec![]);
+        };
+        let sewer_on: bool = sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
             .bind(property_id)
-            .bind(code)
-            .bind(first.to_string())
-            .bind(last.to_string())
             .fetch_one(&self.pool)
             .await?;
-        if changed > 0 {
-            return Ok(Err(BillingError::TariffChangedInPeriod(code.into())));
+        let mut lines = vec![];
+        for code in ["cold", "hot", "sewer", "t1", "t2"] {
+            if code == "sewer" && !sewer_on {
+                continue;
+            }
+            let versions = self.tariff_versions(property_id, code).await?;
+            if let Err(PickError::Split(s)) = pick_tariff(
+                &versions,
+                &first.to_string(),
+                &last.to_string(),
+                TariffPolicy::Strict,
+            ) {
+                lines.push(format!(
+                    "• {}: {} → {} ₽ с {}",
+                    label(code),
+                    money(s.old),
+                    money(s.new),
+                    s.from
+                ));
+            }
         }
-        let price: Option<(String,)> =
-            sqlx::query_as("SELECT price FROM tariff WHERE property_id = ? AND code = ? AND valid_from <= ? ORDER BY valid_from DESC LIMIT 1")
-                .bind(property_id)
-                .bind(code)
-                .bind(first.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(match price {
-            Some((p,)) => Ok(p.parse().unwrap_or_default()),
-            None => Err(BillingError::MissingTariff(code.into())),
-        })
+        Ok(lines)
     }
 
     /// Создаёт черновик счёта за период по подтверждённым показаниям. Дубль за период невозможен (уникальный индекс).
@@ -104,7 +236,9 @@ impl App {
         property_id: i64,
         period: &str,
         now: NaiveDateTime,
+        policy: TariffPolicy,
     ) -> Res<Draft> {
+        let mut notes: Vec<String> = vec![];
         let sewer_enabled: bool =
             sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
                 .bind(property_id)
@@ -134,7 +268,9 @@ impl App {
             .bind(period)
             .fetch_optional(&self.pool)
             .await?;
-            let tariff = self.tariff_for(property_id, code, period).await?;
+            let tariff = self
+                .tariff_for(property_id, code, period, policy, &mut notes)
+                .await?;
             prev_dates.push(previous.as_ref().and_then(|p| p.1.clone()));
             inputs.push(MeterInput {
                 meter_id: code.into(),
@@ -152,7 +288,10 @@ impl App {
             });
         }
         let sewer = if sewer_enabled {
-            match self.tariff_for(property_id, "sewer", period).await? {
+            match self
+                .tariff_for(property_id, "sewer", period, policy, &mut notes)
+                .await?
+            {
                 Ok(tariff) => Some(SewerRule { tariff }),
                 Err(e) => return user_err(explain(&e)),
             }
@@ -166,6 +305,7 @@ impl App {
             currency: "RUB".into(),
             total: bill.total.to_string(),
             policy: "Из каждого накопительного показания берётся целая часть до вычитания; водоотведение = ХВС + ГВС".into(),
+            note: (!notes.is_empty()).then(|| notes.join("\n")),
             lines: bill
                 .lines
                 .iter()
@@ -481,5 +621,129 @@ pub fn format_bill(s: &Snapshot) -> String {
         out.push(line);
     }
     out.push(format!("\nИтого: {} ₽", money(d(&s.total))));
+    if let Some(note) = &s.note {
+        out.push(format!("\nℹ️ {note}"));
+    }
     out.join("\n")
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn v(items: &[(&str, Decimal)]) -> Vec<(String, Decimal)> {
+        items.iter().map(|(d, p)| (d.to_string(), *p)).collect()
+    }
+
+    const START: &str = "2026-10-01";
+    const END: &str = "2026-10-31";
+
+    #[test]
+    fn empty_means_missing() {
+        assert_eq!(
+            pick_tariff(&[], START, END, TariffPolicy::Strict),
+            Err(PickError::Missing)
+        );
+    }
+
+    #[test]
+    fn the_first_ever_tariff_starting_mid_period_is_not_a_change() {
+        // тариф заведён 15 октября, до него тарифа не было: делить нечего
+        let versions = v(&[("2026-10-15", dec!(50))]);
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Ok((dec!(50), None))
+        );
+    }
+
+    #[test]
+    fn a_version_before_the_period_is_used() {
+        let versions = v(&[("2026-01-01", dec!(50)), ("2026-09-01", dec!(55))]);
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Ok((dec!(55), None))
+        );
+    }
+
+    #[test]
+    fn a_version_starting_on_the_first_day_is_not_a_change() {
+        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-01", dec!(55))]);
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Ok((dec!(55), None))
+        );
+    }
+
+    #[test]
+    fn a_later_version_with_the_same_price_is_not_a_change() {
+        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-15", dec!(50.00))]);
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Ok((dec!(50), None))
+        );
+    }
+
+    #[test]
+    fn a_real_change_inside_the_period_needs_a_decision() {
+        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-15", dec!(52))]);
+        let split = TariffSplit {
+            old: dec!(50),
+            new: dec!(52),
+            from: "2026-10-15".into(),
+        };
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Err(PickError::Split(split.clone()))
+        );
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::NewForWholePeriod),
+            Ok((dec!(52), Some(split.clone())))
+        );
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::OldForWholePeriod),
+            Ok((dec!(50), Some(split)))
+        );
+    }
+
+    #[test]
+    fn two_changes_report_the_first_date_and_the_final_price() {
+        let versions = v(&[
+            ("2026-01-01", dec!(50)),
+            ("2026-10-10", dec!(52)),
+            ("2026-10-20", dec!(53)),
+        ]);
+        let Err(PickError::Split(s)) = pick_tariff(&versions, START, END, TariffPolicy::Strict)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (s.old, s.new, s.from.as_str()),
+            (dec!(50), dec!(53), "2026-10-10")
+        );
+    }
+
+    #[test]
+    fn versions_after_the_period_are_ignored() {
+        let versions = v(&[("2026-01-01", dec!(50)), ("2026-11-01", dec!(60))]);
+        assert_eq!(
+            pick_tariff(&versions, START, END, TariffPolicy::Strict),
+            Ok((dec!(50), None))
+        );
+    }
+
+    #[test]
+    fn an_earlier_dated_version_added_later_is_ordered_by_date_not_by_entry() {
+        // владелец ввёл «новые» цены датой 1 октября поверх заведённых с 15 октября (случай из жизни):
+        // 1 окт = 51, 15 окт = 50 → внутри периода цена вернулась к 50, это смена
+        let versions = v(&[("2026-10-01", dec!(51)), ("2026-10-15", dec!(50))]);
+        let Err(PickError::Split(s)) = pick_tariff(&versions, START, END, TariffPolicy::Strict)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (s.old, s.new, s.from.as_str()),
+            (dec!(51), dec!(50), "2026-10-15")
+        );
+    }
 }

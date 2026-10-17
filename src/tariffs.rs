@@ -240,7 +240,26 @@ impl App {
         let Some(property_id) = self.property_id().await? else {
             return user_err("Сначала настройте объект: /setup");
         };
-        answers.push(answer.to_string());
+        // Цена, равная действующей, — не изменение: новая версия тарифа не создаётся (иначе появляются ложные «смены»).
+        let sewer_on: bool = sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let same_as_current = match answer.parse::<Decimal>() {
+            Ok(price)
+                if answer != "keep"
+                    && answer != "off"
+                    && !(CODES[step] == "sewer" && !sewer_on) =>
+            {
+                self.price_on(property_id, CODES[step], &date).await? == Some(price)
+            }
+            _ => false,
+        };
+        answers.push(if same_as_current {
+            "keep".to_string()
+        } else {
+            answer.to_string()
+        });
         let step = step + 1;
         self.set_state(
             from.telegram_id,
@@ -269,12 +288,29 @@ impl App {
                     "• {}: выключить (арендатор не оплачивает)",
                     label(code)
                 )),
-                p => lines.push(format!(
-                    "• {}: {before} → {} ₽ за {}",
-                    label(code),
-                    money(p.parse().unwrap_or_default()),
-                    unit(code)
-                )),
+                p => {
+                    lines.push(format!(
+                        "• {}: {before} → {} ₽ за {}",
+                        label(code),
+                        money(p.parse().unwrap_or_default()),
+                        unit(code)
+                    ));
+                    // версия, начинающаяся позже выбранной даты, перекроет новую цену — об этом лучше узнать сейчас
+                    let later: Option<(String, String)> = sqlx::query_as(
+                        "SELECT valid_from, price FROM tariff WHERE property_id = ? AND code = ? AND valid_from > ? ORDER BY valid_from LIMIT 1",
+                    )
+                    .bind(property_id)
+                    .bind(code)
+                    .bind(&date)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                    if let Some((from_date, price)) = later {
+                        lines.push(format!(
+                            "   ⚠️ с {from_date} уже задана цена {} ₽ — после этой даты будет действовать она",
+                            money(price.parse().unwrap_or_default())
+                        ));
+                    }
+                }
             }
         }
         if lines.is_empty() {
@@ -355,11 +391,22 @@ impl App {
         }
         tx.commit().await?;
         self.clear_state(from.telegram_id).await?;
-        Ok(vec![Reply::text(
-            from.chat_id,
-            format!(
-                "✅ Тарифы сохранены, действуют с {date}.\nЕсли арендатор уже прислал все показания, а расчёт ждал тарифов, выполните /calc."
-            ),
-        )])
+        let period = self.open_period(property_id, now).await?;
+        let ready = self.received(property_id, &period).await?.len() == 4
+            && !self.period_billed(property_id, &period).await?;
+        Ok(vec![if ready {
+            Reply::with_buttons(
+                from.chat_id,
+                format!(
+                    "✅ Тарифы сохранены, действуют с {date}.\nПоказания за {period} уже получены — можно пересчитать."
+                ),
+                vec![vec![("▶️ Пересчитать период", "cc".into())]],
+            )
+        } else {
+            Reply::text(
+                from.chat_id,
+                format!("✅ Тарифы сохранены, действуют с {date}."),
+            )
+        }])
     }
 }

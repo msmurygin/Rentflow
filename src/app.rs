@@ -408,6 +408,15 @@ impl App {
             (Who::Landlord(_), "ap") => self.bill_approve(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rj") => self.bill_reject(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "pd") => self.bill_paid(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "cn") => {
+                self.calc_with(from, now, crate::bills::TariffPolicy::NewForWholePeriod)
+                    .await
+            }
+            (Who::Landlord(_), "co") => {
+                self.calc_with(from, now, crate::bills::TariffPolicy::OldForWholePeriod)
+                    .await
+            }
+            (Who::Landlord(_), "cc") => self.calc_cmd(from, now).await,
             (Who::Landlord(_), "pr") => self.proof_set(from, a.unwrap_or("")).await,
             (Who::Landlord(_), "th") => self.tariff_history(from, now).await,
             (Who::Landlord(_), "tnew") => self.tariff_start(from, now).await,

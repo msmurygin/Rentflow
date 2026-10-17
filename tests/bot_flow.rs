@@ -117,6 +117,11 @@ impl H {
 
     /// Настройка объекта по данным golden dataset: июльские тарифы, дата baseline неизвестна. Настройки по умолчанию.
     async fn setup_defaults(&self, now: NaiveDateTime) {
+        self.setup_defaults_with_tariff_date(now, "2026-01-01")
+            .await;
+    }
+
+    async fn setup_defaults_with_tariff_date(&self, now: NaiveDateTime, tariff_from: &str) {
         self.say(LANDLORD, "/setup", now).await;
         for a in [
             "Квартира на Тверской",
@@ -126,7 +131,7 @@ impl H {
             "416",
             "3831",
             "1118",
-            "2026-01-01",
+            tariff_from,
             "65,77",
             "312,50",
             "51,62",
@@ -594,23 +599,187 @@ async fn missing_register_blocks_sending_and_billing() {
 }
 
 #[tokio::test]
-async fn tariff_change_inside_the_period_blocks_automatic_billing() {
+async fn real_price_change_inside_the_period_blocks_billing_and_offers_a_choice() {
     let h = H::ready().await;
     let now = at(2026, 7, 25);
     h.say(LANDLORD, "/tariff t1 9 2026-07-15", now).await;
     let r = h.month(now, ["755", "417", "3975", "1179"]).await;
     assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
-    let landlord = to_chat(&r, LANDLORD);
+    let landlord = r
+        .iter()
+        .find(|x| x.chat_id == LANDLORD * 100)
+        .expect("owner is told");
     assert!(
-        landlord.contains("тариф менялся внутри периода"),
-        "{landlord}"
+        landlord
+            .text
+            .contains("Электричество T1: 8,60 → 9,00 ₽ с 2026-07-15"),
+        "{}",
+        landlord.text
     );
-    sqlx::query("UPDATE tariff SET valid_from = '2026-08-01' WHERE code = 't1' AND price = '9'")
-        .execute(h.app.pool())
+    assert!(landlord.text.contains("ваше решение"), "{}", landlord.text);
+    assert!(
+        landlord.buttons.iter().flatten().any(|b| b.data == "cn")
+            && landlord.buttons.iter().flatten().any(|b| b.data == "co")
+    );
+    // и без решения /calc тоже не считает, а снова предлагает выбор
+    let r = h.say(LANDLORD, "/calc", now).await;
+    assert!(
+        r[0].buttons.iter().flatten().any(|b| b.data == "cn"),
+        "{r:?}"
+    );
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
+}
+
+#[tokio::test]
+async fn owner_can_apply_the_new_price_to_the_whole_period_and_it_is_recorded_in_the_bill() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(LANDLORD, "/tariff t1 9 2026-07-15", now).await;
+    h.month(now, ["755", "417", "3975", "1179"]).await;
+    let r = h.tap(LANDLORD, "cn", now).await;
+    let text = all_text(&r);
+    // T1: 144 кВт·ч × 9,00 = 1296,00 вместо 1238,40 → итог 2063,61 + 57,60 = 2121,21
+    assert!(
+        text.contains("Электричество T1: 3975 − 3831 = 144 кВт·ч × 9,00 = 1296,00 ₽"),
+        "{text}"
+    );
+    assert!(text.contains("Итого: 2121,21 ₽"), "{text}");
+    assert!(
+        text.contains("по решению владельца для всего периода применён новый тариф"),
+        "решение записано в счёте: {text}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM bill WHERE status = 'draft'")
+            .await,
+        1
+    );
+    let snapshot: String = sqlx::query_scalar("SELECT snapshot FROM bill")
+        .fetch_one(h.app.pool())
         .await
         .unwrap();
-    let r = h.say(LANDLORD, "/calc", now).await;
-    assert!(r[0].text.contains("Итого"), "{r:?}");
+    assert!(snapshot.contains("по решению владельца"), "{snapshot}");
+}
+
+#[tokio::test]
+async fn owner_can_apply_the_old_price_to_the_whole_period() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(LANDLORD, "/tariff t1 9 2026-07-15", now).await;
+    h.month(now, ["755", "417", "3975", "1179"]).await;
+    let r = h.tap(LANDLORD, "co", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Итого: 2063,61 ₽") && text.contains("применён прежний тариф"),
+        "{text}"
+    );
+    // повторное решение не создаёт второй счёт
+    let again = h.tap(LANDLORD, "cn", now).await;
+    assert!(again[0].text.contains("счёт уже есть"), "{again:?}");
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 1);
+}
+
+#[tokio::test]
+async fn a_first_tariff_that_starts_mid_period_is_not_a_change() {
+    // ровно сценарий из жизни: тарифы заведены 15 октября, показания пришли 17-го — расчёт идёт без «ручной разбивки»
+    let h = H::new().await;
+    h.setup_defaults_with_tariff_date(at(2026, 10, 15), "2026-10-15")
+        .await;
+    h.set_proof(false).await;
+    h.connect_tenant(at(2026, 10, 15)).await;
+    let r = h
+        .month(at(2026, 10, 17), ["755", "417", "3975,48", "1179"])
+        .await;
+    let draft = r
+        .iter()
+        .find(|x| x.chat_id == LANDLORD * 100)
+        .expect("draft goes to the owner");
+    assert!(draft.text.contains("Итого: 2063,61 ₽"), "{}", draft.text);
+    assert!(
+        !draft.text.contains("ℹ️"),
+        "никаких решений владельца не понадобилось: {}",
+        draft.text
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM bill WHERE status = 'draft'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn re_entering_the_same_prices_with_an_earlier_date_changes_nothing_and_does_not_block() {
+    let h = H::new().await;
+    h.setup_defaults_with_tariff_date(at(2026, 10, 15), "2026-10-15")
+        .await;
+    h.set_proof(false).await;
+    h.connect_tenant(at(2026, 10, 15)).await;
+    h.month(at(2026, 10, 17), ["755", "417", "3975,48", "1179"])
+        .await; // черновик ждёт решения владельца
+    h.tap(LANDLORD, "rj:1", at(2026, 10, 17)).await; // отклонили, чтобы вернуться к тарифам
+    // владелец открывает меню и вводит те же цены с 1 октября — как в жизни; ничего не должно записаться
+    h.say(LANDLORD, "/tariff", at(2026, 10, 17)).await;
+    h.tap(LANDLORD, "td:2026-10-01", at(2026, 10, 17)).await;
+    for price in ["65,77", "312,50", "51,62", "8,60"] {
+        h.say(LANDLORD, price, at(2026, 10, 17)).await;
+    }
+    let r = h.say(LANDLORD, "3,71", at(2026, 10, 17)).await;
+    assert!(
+        all_text(&r).contains("Ничего не меняется"),
+        "одинаковые цены — это не изменение: {r:?}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM tariff WHERE valid_from = '2026-10-01'")
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn menu_warns_when_a_later_tariff_will_override_the_new_one() {
+    // жизненный случай: цены уже заведены с 15 октября, а владелец «меняет» их с 1 октября
+    let h = H::new().await;
+    h.setup_defaults_with_tariff_date(at(2026, 10, 15), "2026-10-15")
+        .await;
+    let now = at(2026, 10, 17);
+    h.say(LANDLORD, "/tariff", now).await;
+    h.tap(LANDLORD, "td:2026-10-01", now).await;
+    h.say(LANDLORD, "70", now).await;
+    for _ in 0..3 {
+        h.tap(LANDLORD, "tk", now).await;
+    }
+    let r = h.tap(LANDLORD, "tk", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Холодная вода (ХВС): 65,77 ₽ → 70,00 ₽"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "⚠️ с 2026-10-15 уже задана цена 65,77 ₽ — после этой даты будет действовать она"
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn saving_tariffs_offers_a_recalc_button_when_the_readings_are_waiting() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    h.say(LANDLORD, "/tariff t1 9 2026-07-15", now).await;
+    h.month(now, ["755", "417", "3975", "1179"]).await; // расчёт ждёт решения о цене
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
+    h.say(LANDLORD, "/tariff", now).await;
+    h.tap(LANDLORD, "td:2026-08-01", now).await;
+    h.say(LANDLORD, "70", now).await;
+    for _ in 0..3 {
+        h.tap(LANDLORD, "tk", now).await;
+    }
+    h.tap(LANDLORD, "tk", now).await;
+    let r = h.tap(LANDLORD, "ts", now).await;
+    assert!(
+        buttons(&r).contains(&"cc".to_string()),
+        "после сохранения тарифов предлагается пересчёт: {r:?}"
+    );
 }
 
 #[tokio::test]
