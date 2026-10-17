@@ -42,6 +42,17 @@ async fn cli(cmd: &str, args: &[String]) -> Result<()> {
             println!("{}", dir.display());
             Ok(())
         }
+        "metrics" => {
+            let pool = rentflow::db::connect(&database_url).await?;
+            let app = rentflow::app::App::new(
+                pool,
+                Default::default(),
+                std::sync::Arc::new(rentflow::ocr::NoExtractor),
+            );
+            let m = app.metrics(now).await?;
+            println!("{}", serde_json::to_string_pretty(&m)?);
+            Ok(())
+        }
         "verify-backup" => {
             let dir = args.first().context("укажите каталог копии")?;
             let report = backup::verify_backup(std::path::Path::new(dir)).await?;

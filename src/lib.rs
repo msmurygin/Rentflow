@@ -7,6 +7,8 @@ pub mod billing;
 pub mod bills;
 pub mod bot;
 pub mod db;
+pub mod demo;
+pub mod metrics;
 pub mod ocr;
 pub mod ops;
 pub mod readings;

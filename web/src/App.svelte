@@ -25,6 +25,11 @@
   let finishing = $state(false);
 
   async function login() {
+    if (session.demo) {
+      // демо-сессия истекла: возвращаемся к настоящему входу
+      location.reload();
+      return;
+    }
     const r = await api.post<{ token: string }>('/auth/telegram', { init_data: tg.initData });
     setToken(r.token);
   }
@@ -88,6 +93,12 @@
   }
 </script>
 
+{#if session.demo}
+  <div class="sticky top-0 z-30 flex items-center justify-between gap-2 bg-brand px-4 py-2 text-sm text-brandfg">
+    <span>{t('demo.banner')}</span>
+    <button class="underline" onclick={() => location.reload()}>{t('demo.exit')}</button>
+  </div>
+{/if}
 <main class="mx-auto min-h-dvh max-w-xl px-4 pt-4 pb-[calc(6rem+env(safe-area-inset-bottom))]">
   {#if boot === 'ready' && session.me}
     {#if stage === 'welcome'}

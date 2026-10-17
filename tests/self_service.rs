@@ -479,3 +479,14 @@ async fn failed_deliveries_are_counted_in_the_vitals_without_message_text() {
             .unwrap();
     assert!(!cols.iter().any(|c| c == "text" || c == "body"));
 }
+
+#[tokio::test]
+async fn privacy_notice_is_available_to_strangers() {
+    use rentflow::app::Incoming;
+    let w = World::new().await;
+    let r = w
+        .app
+        .handle(&sender(777), Incoming::Text("/privacy".into()), now())
+        .await;
+    assert!(r[0].text.contains("Какие данные хранит RentFlow"), "{r:?}");
+}

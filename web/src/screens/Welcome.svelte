@@ -5,7 +5,8 @@
   import { api, errorText } from '../lib/api';
   import { t } from '../lib/i18n';
   import { tokenFrom } from '../lib/format';
-  import { notify } from '../lib/store.svelte';
+  import { notify, session } from '../lib/store.svelte';
+  import { setToken } from '../lib/api';
 
   let { onchange }: { onchange: () => void } = $props();
   let busy = $state(false);
@@ -16,6 +17,20 @@
     busy = true;
     try {
       await api.post('/register');
+      onchange();
+    } catch (e) {
+      notify(errorText(e, t('genericError'), t('offline')), 'err');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function demo() {
+    busy = true;
+    try {
+      const r = await api.post<{ token: string }>('/demo/start');
+      setToken(r.token);
+      session.demo = true;
       onchange();
     } catch (e) {
       notify(errorText(e, t('genericError'), t('offline')), 'err');
@@ -46,6 +61,7 @@
     <p class="mt-2 text-sm text-muted">{t('welcome.text')}</p>
   </div>
   <Btn {busy} onclick={registerOwner}>🏠 {t('welcome.owner')}</Btn>
+  <Btn variant="secondary" {busy} onclick={demo}>👀 {t('welcome.demo')}</Btn>
   {#if !tenant}
     <Btn variant="secondary" onclick={() => (tenant = true)}>🔑 {t('welcome.tenant')}</Btn>
   {:else}

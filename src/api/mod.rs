@@ -2,6 +2,7 @@
 //! вызывает те же сервисы `App`, что и бот, и превращает результат в JSON. Деньги считает только `billing`.
 
 pub mod auth;
+pub mod limit;
 
 use crate::app::{App, AppError, MRole, Reply, Sender, UserRow, Who, now_iso};
 use crate::bills::{TariffRow, effective_tariff};
@@ -47,6 +48,7 @@ pub struct ApiState {
     pub init_data_max_age_secs: i64,
     pub session_ttl_days: i64,
     pub clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    pub limiter: limit::Limiter,
 }
 
 impl ApiState {
@@ -64,7 +66,24 @@ impl ApiState {
             init_data_max_age_secs: 24 * 3600,
             session_ttl_days: 7,
             clock: Arc::new(Utc::now),
+            limiter: Default::default(),
         }
+    }
+
+    /// Пускает действие `kind` не чаще `max` раз за окно; иначе 429. Успешная проверка действие записывает.
+    fn throttle(
+        &self,
+        kind: &'static str,
+        who: i64,
+        max: usize,
+        window_secs: i64,
+    ) -> Result<(), ApiError> {
+        let now = (self.clock)().timestamp();
+        if !self.limiter.allows(kind, who, max, window_secs, now) {
+            return Err(ApiError::TooMany);
+        }
+        self.limiter.record(kind, who, now);
+        Ok(())
     }
 
     /// Местное время: расчётный месяц определяется по нему, а не по UTC.
@@ -94,6 +113,7 @@ pub enum ApiError {
     NotFound,
     Conflict(String),
     User(String),
+    TooMany,
     Internal,
 }
 
@@ -126,6 +146,10 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Не найдено.".to_string()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::User(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::TooMany => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Слишком много попыток. Подождите немного и повторите.".to_string(),
+            ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Внутренняя ошибка.".to_string(),
@@ -382,6 +406,7 @@ async fn me(State(st): St, AnySession(sender): AnySession) -> ApiResult {
 
 /// Самостоятельная регистрация собственника. Повторный вызов безопасен. Арендатором становятся только по приглашению.
 async fn register(State(st): St, AnySession(sender): AnySession) -> ApiResult {
+    st.throttle("register", sender.telegram_id, 10, 3600)?;
     st.app.register_owner(&sender, st.now()).await?;
     let ctx_audit = sqlx::query(
         "INSERT INTO audit_log (at, actor, action, entity) VALUES (?, ?, 'owner_register', 'user')",
@@ -609,6 +634,7 @@ async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<
 
 /// `POST /api/properties` — ещё одна квартира у владельца. Активной не становится: клиент сам выбирает объект заголовком.
 async fn post_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> ApiResult {
+    st.throttle("property_create", ctx.sender.telegram_id, 20, 3600)?;
     let id = create_from_body(&st, &ctx, &b).await?;
     let user_id = match &ctx.role {
         Role::Landlord(u) | Role::Tenant(u) => u.id,
@@ -692,6 +718,7 @@ async fn set_proof(st: &ApiState, property_id: i64, on: bool) -> Result<(), ApiE
 
 async fn create_invitation(State(st): St, ctx: Ctx) -> ApiResult {
     ctx.landlord()?;
+    st.throttle("invite_create", ctx.sender.telegram_id, 20, 3600)?;
     let property_id = st.need_property(&ctx).await?;
     let token = st.app.create_invite(property_id, st.now()).await?;
     st.audit(
@@ -1394,11 +1421,26 @@ async fn invitation_accept(
     Json(b): Json<AcceptBody>,
 ) -> ApiResult {
     let now = st.now();
+    let unix = (st.clock)().timestamp();
+    // перебор чужих приглашений: после 5 неудач за 15 минут вход по приглашению закрыт на это окно
+    if !st
+        .limiter
+        .allows("invite_fail", sender.telegram_id, 5, 900, unix)
+    {
+        return Err(ApiError::TooMany);
+    }
     let who = st.app.who(&sender, now).await?;
     let replies = st
         .app
         .accept_invite(&sender, &who, b.token.trim(), now)
-        .await?;
+        .await;
+    let replies = match replies {
+        Ok(r) if r.iter().any(|r| r.text.contains("Вы подключены")) => r,
+        other => {
+            st.limiter.record("invite_fail", sender.telegram_id, unix);
+            other?
+        }
+    };
     let others: Vec<Reply> = replies
         .into_iter()
         .filter(|r| r.chat_id != sender.chat_id)
@@ -1407,6 +1449,59 @@ async fn invitation_accept(
         st.notifier.send(others).await;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /api/demo/start` — сессия демо-владельца. Демо только читает: запись закрывает `demo_readonly`.
+async fn demo_start(State(st): St) -> ApiResult {
+    st.throttle("demo_start", 0, 120, 3600)?;
+    let now = st.now();
+    st.app.ensure_demo(now).await?;
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query("INSERT INTO api_session (token_hash, telegram_id, name, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(token_hash(&token))
+        .bind(crate::demo::DEMO_OWNER_ID)
+        .bind("Демо")
+        .bind(now_iso(now))
+        .bind(now_iso(now + Duration::hours(6)))
+        .execute(st.app.pool())
+        .await?;
+    Ok(Json(
+        json!({ "token": token, "role": "landlord", "name": "Демо", "demo": true }),
+    ))
+}
+
+/// Демо-сессии (отрицательный Telegram-id) могут только читать: любой запрос на изменение — 403.
+async fn demo_readonly(
+    State(st): St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        let token = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if let Some(t) = token {
+            let id: Option<i64> =
+                sqlx::query_scalar("SELECT telegram_id FROM api_session WHERE token_hash = ?")
+                    .bind(token_hash(t))
+                    .fetch_optional(st.app.pool())
+                    .await
+                    .ok()
+                    .flatten();
+            if id.is_some_and(crate::demo::is_demo) {
+                return ApiError::Forbidden("Демо только для просмотра: создайте свою квартиру.")
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 async fn healthz() -> &'static str {
@@ -1431,6 +1526,7 @@ async fn readyz(State(st): St) -> (StatusCode, Json<Value>) {
 pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/auth/telegram", post(auth_telegram))
+        .route("/demo/start", post(demo_start))
         .route("/me", get(me))
         .route("/register", post(register))
         .route("/home", get(home))
@@ -1461,7 +1557,11 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/bills/{id}/paid", post(bill_paid))
         .route("/bills/{id}/reissue", post(bill_reissue))
         .route("/bills/{id}/void", post(bill_void))
-        .route("/photos/{id}", get(reading_photo));
+        .route("/photos/{id}", get(reading_photo))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            demo_readonly,
+        ));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))

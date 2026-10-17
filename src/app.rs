@@ -180,6 +180,15 @@ pub fn now_iso(now: NaiveDateTime) -> String {
     now.format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
+/// Краткая памятка о данных (полный текст — `docs/v0.3/PRIVACY.md`).
+pub const PRIVACY_NOTICE: &str = "Какие данные хранит RentFlow:\n\
+• Telegram-ID и имя из Telegram;\n\
+• название/адрес квартиры и имя арендатора, которые вводит владелец;\n\
+• показания счётчиков, фото счётчиков, тарифы и счета.\n\
+Видят их только владелец и арендатор этой квартиры. Данные нужны для расчёта и не передаются третьим лицам, \
+кроме самого Telegram и распознавания фото счётчика сервисом Anthropic (если оно включено). \
+Чтобы получить выгрузку или удалить данные, напишите администратору сервиса. Счета хранятся для учёта, пока владелец ведёт квартиру.";
+
 impl App {
     pub fn new(pool: SqlitePool, cfg: Config, extractor: Arc<dyn Extractor>) -> Self {
         Self {
@@ -528,6 +537,7 @@ impl App {
                 )]);
             }
             "/help" => return Ok(vec![self.help(from, who)]),
+            "/privacy" => return Ok(vec![Reply::text(from.chat_id, PRIVACY_NOTICE)]),
             "/cancel" => {
                 self.clear_state(from.telegram_id).await?;
                 return Ok(vec![Reply::text(from.chat_id, "Отменено.")]);

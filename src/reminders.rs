@@ -209,6 +209,8 @@ impl App {
             }
         }
         out.extend(self.payment_reminders(utc).await?);
+        // демо-пользователи (отрицательные id) — не люди в Telegram: им ничего не отправляем
+        out.retain(|r| r.chat_id > 0);
         Ok(out)
     }
 

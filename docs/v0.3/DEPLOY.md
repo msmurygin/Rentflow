@@ -96,3 +96,16 @@ git rev-parse HEAD > /var/backups/rentflow/previous_release   # коммит, н
 - Payment deadline: set per property (`payment_days`), `due_date` is fixed at approval; overdue is computed in the property timezone and also triggers a reminder.
 - Delivery failures are logged in `notification_log` (safe reason codes only, no message text); more than 5 in 24h alerts `ADMIN_TELEGRAM_ID` ("notify").
 - Rollback: the image can be rolled back (new tables/columns are ignored by old code); no restore needed.
+
+## Milestone 5 — заметки к релизу
+
+Миграций нет, переменных окружения не добавлено. Выкладка — по п. 1; обязательно после накопленных 0008–0010:
+`deploy/restore-staging.sh` с образом релиза на копии production.
+
+Smoke после выкладки (дополнительно): `/privacy` в боте отвечает; в Mini App у незнакомого аккаунта работает «Посмотреть демо»
+(виден баннер; кнопки изменения дают «Демо только для просмотра»); `docker compose exec -T rentflow rentflow metrics`
+выводит JSON. Демо-квартира создаётся при первом нажатии (одна запись `property` у пользователя с отрицательным Telegram-ID).
+
+**Откат:** образ M5 схему не меняет — вариант A (`git checkout $(cat /var/backups/rentflow/previous_release) && docker compose up -d --build`).
+Старый образ демо-пользователей не знает: если демо уже создано, они остаются в базе как неактивные записи (безвредно).
+Если нужно убрать демо целиком — см. `docs/v0.3/PRIVACY.md`/админ: удалить квартиры `landlord_id` пользователя с `telegram_id = -1000` после копии базы.

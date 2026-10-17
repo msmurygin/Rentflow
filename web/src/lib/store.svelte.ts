@@ -4,7 +4,7 @@ import type { Me } from './types';
 export type Tab = 'home' | 'property' | 'readings' | 'tariffs' | 'bills';
 
 /** `epoch` растёт при смене квартиры: экраны пересоздаются и заново загружают данные нужного объекта. */
-export const session = $state<{ me: Me | null; propertyId: number | null; epoch: number }>({ me: null, propertyId: null, epoch: 0 });
+export const session = $state<{ me: Me | null; propertyId: number | null; epoch: number; demo: boolean }>({ me: null, propertyId: null, epoch: 0, demo: false });
 export const nav = $state<{ tab: Tab; billId: number | null }>({ tab: 'home', billId: null });
 export const toast = $state<{ text: string; kind: 'ok' | 'err'; id: number }>({ text: '', kind: 'ok', id: 0 });
 
