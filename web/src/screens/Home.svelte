@@ -79,8 +79,9 @@
             <span class="num text-sm text-muted">{home.received}/{home.total_registers}</span>
           </div>
           <p class="mt-2 text-sm">
-            {#if home.billed}{home.next_due ? `${t('home.nextDue')}: ${dateLong(home.next_due)}` : t('home.readingsDone')}
+            {#if home.billed}{home.due_date ?? home.next_due ? `${t('home.nextDue')}: ${dateLong(home.due_date ?? home.next_due)}` : t('home.readingsDone')}
             {:else if (home.received ?? 0) >= (home.total_registers ?? 4)}{t('home.readingsDone')}
+            {:else if home.due_date}{t('home.dueOn')}: {dateLong(home.due_date)}{landlord ? ` · ${t('home.readingsProgress', { n: home.received ?? 0, total: home.total_registers ?? 4 })}` : ''}
             {:else}{landlord ? t('home.readingsProgress', { n: home.received ?? 0, total: home.total_registers ?? 4 }) : t('home.dueNow')}{/if}
           </p>
         </Card>

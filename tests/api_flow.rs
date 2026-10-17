@@ -831,3 +831,187 @@ async fn static_frontend_and_health_are_served_without_auth() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn schedule_and_void_work_through_the_api() {
+    let api = Api::new().await;
+    let landlord = api.login(LANDLORD).await;
+    api.setup_property(&landlord).await;
+    let tenant = api.connect_tenant(&landlord).await;
+    sqlx::query("UPDATE property SET proof_required = 0")
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+
+    // расписание: 1–28, 0 снимает; арендатор не меняет
+    let (s, v) = api
+        .call(
+            Method::PUT,
+            "/api/property",
+            Some(&landlord),
+            Some(json!({ "reading_day": 25 })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["property"]["reading_day"].clone()),
+        (StatusCode::OK, json!(25)),
+        "{v}"
+    );
+    let (s, _) = api
+        .call(
+            Method::PUT,
+            "/api/property",
+            Some(&landlord),
+            Some(json!({ "reading_day": 31 })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (s, _) = api
+        .call(
+            Method::PUT,
+            "/api/property",
+            Some(&tenant),
+            Some(json!({ "reading_day": 5 })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (_, h) = api
+        .call(Method::GET, "/api/home", Some(&tenant), None)
+        .await;
+    assert_eq!(h["due_date"], "2026-10-25");
+
+    // счёт утверждён и оплачен
+    for (code, value) in [
+        ("cold", "755"),
+        ("hot", "417"),
+        ("t1", "3975,48"),
+        ("t2", "1179"),
+    ] {
+        api.call(
+            Method::PUT,
+            "/api/readings/draft",
+            Some(&tenant),
+            Some(json!({ "code": code, "value": value })),
+        )
+        .await;
+    }
+    api.call(
+        Method::POST,
+        "/api/readings/submit",
+        Some(&tenant),
+        Some(json!({})),
+    )
+    .await;
+    let (_, v) = api
+        .call(Method::GET, "/api/bills", Some(&landlord), None)
+        .await;
+    let id = v["bills"][0]["id"].as_i64().unwrap();
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/approve"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/paid"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    let (_, h) = api
+        .call(Method::GET, "/api/home", Some(&tenant), None)
+        .await;
+    assert_eq!(
+        h["due_date"], "2026-11-25",
+        "после отправки срок — следующий месяц"
+    );
+
+    // арендатор не аннулирует; без причины и без явного подтверждения оплаченного — нет
+    let url = format!("/api/bills/{id}/void");
+    let (s, _) = api
+        .call(
+            Method::POST,
+            &url,
+            Some(&tenant),
+            Some(json!({ "reason": "x", "confirm_paid": true })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = api
+        .call(
+            Method::POST,
+            &url,
+            Some(&landlord),
+            Some(json!({ "reason": "  " })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (s, _) = api
+        .call(
+            Method::POST,
+            &url,
+            Some(&landlord),
+            Some(json!({ "reason": "тест" })),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "оплаченный без confirm_paid"
+    );
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (d["status"].as_str(), d["can_void"].clone()),
+        (Some("paid"), json!(true))
+    );
+
+    // с подтверждением — аннулирован, арендатор уведомлён, показания открыты; повтор — отказ
+    api.outbox.0.lock().unwrap().clear();
+    let (s, v) = api
+        .call(
+            Method::POST,
+            &url,
+            Some(&landlord),
+            Some(json!({ "reason": "тест", "confirm_paid": true })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["status"].as_str()),
+        (StatusCode::OK, Some("void")),
+        "{v}"
+    );
+    assert!(
+        api.outbox
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.chat_id == TENANT && r.text.contains("аннулирован"))
+    );
+    let (s, _) = api
+        .call(
+            Method::POST,
+            &url,
+            Some(&landlord),
+            Some(json!({ "reason": "тест", "confirm_paid": true })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, f) = api
+        .call(Method::GET, "/api/readings/draft", Some(&tenant), None)
+        .await;
+    assert_eq!(f["billed"], false);
+    let (_, v) = api
+        .call(Method::GET, "/api/tariffs", Some(&landlord), None)
+        .await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 5, "тарифы на месте");
+}

@@ -135,6 +135,9 @@ pub enum State {
     Void {
         bill_id: i64,
         reason: Option<String>,
+        /// владелец видел счёт оплаченным — подтверждение действует только для такого статуса
+        #[serde(default)]
+        paid: bool,
     },
     /// Меню тарифов: выбрана ли дата, номер шага и ответы (`keep` | `off` | цена).
     Tariff {
@@ -331,7 +334,8 @@ impl App {
                 /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
-                /void — аннулировать утверждённый неоплаченный счёт (с причиной)\n\
+                /schedule — день передачи показаний и напоминания (/schedule 25, /schedule off)\n\
+                /void — аннулировать утверждённый или оплаченный счёт (с причиной и подтверждением)\n\
                 /calc — пересчитать период, когда все показания уже приняты\n\
                 /whoami — ваш Telegram-ID"
             }
@@ -381,6 +385,7 @@ impl App {
                 "/paid" => self.paid_list(from).await,
                 "/reissue" => self.reissue_list(from).await,
                 "/void" => self.void_list(from).await,
+                "/schedule" => self.schedule_cmd(from, text).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),

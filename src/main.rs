@@ -117,6 +117,20 @@ async fn main() -> Result<()> {
             tracing::warn!(error = %e, "не удалось задать кнопку меню Mini App");
         }
     }
+    // Напоминания арендатору и владельцу по расписанию передачи показаний (журнал в базе не даёт повторов).
+    {
+        let (bot, app) = (bot.clone(), app.clone());
+        tokio::spawn(async move {
+            loop {
+                let now = chrono::Utc::now().naive_utc() + chrono::Duration::hours(tz_offset_hours);
+                match app.due_reminders(now).await {
+                    Ok(replies) => rentflow::bot::send_all(&bot, replies).await,
+                    Err(e) => tracing::error!(error = %e, "reminders failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        });
+    }
     rentflow::bot::run(bot, app, tz_offset_hours).await;
     Ok(())
 }

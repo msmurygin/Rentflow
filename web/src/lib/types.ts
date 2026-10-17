@@ -20,6 +20,7 @@ export interface Property {
   name: string;
   tenant_name: string;
   tenant_connected: boolean;
+  reading_day: number | null;
   proof_required?: boolean;
   registers: Register[];
 }
@@ -41,6 +42,7 @@ export interface Home {
   total_registers?: number;
   billed?: boolean;
   next_due?: string | null;
+  due_date?: string | null;
   last_bill?: { id: number; period: string; status: BillStatus; total: string } | null;
 }
 export interface MeterRow {
@@ -104,4 +106,5 @@ export interface BillDetail extends BillSummary {
   can_reject: boolean;
   can_mark_paid: boolean;
   can_reissue: boolean;
+  can_void: boolean;
 }

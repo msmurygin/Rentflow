@@ -31,6 +31,7 @@
   let errors = $state<Record<string, string>>({});
   let busy = $state(false);
 
+  let readingDay = $state('');
   let editing = $state(false);
   let invite = $state<{ url: string; ttl_days: number } | null>(null);
 
@@ -43,6 +44,7 @@
       if (!isValidNumber(prices[c])) e[`p_${c}`] = 'Нужно число';
     }
     if (sewerOn && !isValidNumber(sewerPrice)) e.sewer = 'Нужно число';
+    if (readingDay.trim() && !/^([1-9]|1\d|2[0-8])$/.test(readingDay.trim())) e.readingDay = 'Число от 1 до 28';
     errors = e;
     return Object.keys(e).length === 0;
   }
@@ -59,6 +61,7 @@
         prices,
         sewer_price: sewerOn ? sewerPrice : null,
         proof_required: proof,
+        reading_day: readingDay.trim() ? Number(readingDay) : 0,
       });
       if (session.me) session.me.property_configured = true;
       tg.haptic('success');
@@ -116,6 +119,7 @@
             <Field label={t('property.name')} bind:value={name} error={errors.name} placeholder="Квартира на Тверской" />
             <Field label={t('property.tenant')} bind:value={tenant} error={errors.tenant} />
             <Field label={t('property.baseDate')} bind:value={baseDate} type="date" hint={t('property.baseDateHint')} />
+            <Field label={t('property.readingDay')} bind:value={readingDay} inputmode="numeric" hint={t('property.readingDayHint')} error={errors.readingDay} />
           </Card>
           <Card class="grid gap-3">
             <div>
@@ -158,7 +162,7 @@
             <p class="text-sm text-muted">{p.tenant_name} · {p.tenant_connected ? t('property.connected') : t('property.notConnected')}</p>
           </div>
           {#if landlord}
-            <button class="text-sm font-semibold text-brand" onclick={() => { name = p.name; tenant = p.tenant_name; editing = !editing; }}>{t('property.edit')}</button>
+            <button class="text-sm font-semibold text-brand" onclick={() => { name = p.name; tenant = p.tenant_name; readingDay = p.reading_day ? String(p.reading_day) : ''; errors = {}; editing = !editing; }}>{t('property.edit')}</button>
           {/if}
         </div>
 
@@ -166,9 +170,14 @@
           <Card class="grid gap-3">
             <Field label={t('property.name')} bind:value={name} />
             <Field label={t('property.tenant')} bind:value={tenant} />
-            <Btn {busy} onclick={() => patch({ name, tenant_name: tenant })}>{t('save')}</Btn>
+            <Field label={t('property.readingDay')} bind:value={readingDay} inputmode="numeric" hint={t('property.readingDayHint')} error={errors.readingDay} />
+            <Btn {busy} onclick={() => { if (readingDay.trim() && !/^([1-9]|1\d|2[0-8])$/.test(readingDay.trim())) { errors.readingDay = 'Число от 1 до 28'; return; } errors.readingDay = ''; void patch({ name, tenant_name: tenant, reading_day: readingDay.trim() ? Number(readingDay) : 0 }); }}>{t('save')}</Btn>
           </Card>
         {/if}
+
+        <Card>
+          <p class="text-sm">{p.reading_day ? t('property.readingDayShow', { day: p.reading_day }) : t('property.readingDayNone')}</p>
+        </Card>
 
         <Card>
           <h2 class="mb-2 font-semibold">{t('property.registers')}</h2>

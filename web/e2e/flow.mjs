@@ -143,6 +143,32 @@ await owner.getByRole('button', { name: 'Отметить оплаченным' 
 await owner.locator('div[role=dialog]').getByRole('button', { name: 'Отметить оплаченным' }).click();
 await owner.getByText('Оплачен').first().waitFor();
 await shot(owner, 'owner-bill-paid');
+// 6b. расписание и аннулирование оплаченного счёта
+await owner.getByRole('button', { name: 'Квартира' }).click();
+await owner.getByRole('button', { name: 'Изменить' }).click();
+await owner.getByLabel('День передачи показаний').fill('25');
+await owner.getByRole('button', { name: 'Сохранить' }).click();
+await owner.getByText('Показания — до 25-го числа каждого месяца').waitFor();
+check(true, 'день передачи показаний сохранён');
+await owner.getByRole('button', { name: 'Счета' }).click();
+await owner.getByRole('button', { name: /Октябрь 2026/ }).first().click();
+await owner.getByRole('button', { name: 'Аннулировать' }).click();
+await owner.getByText('Счёт уже ОПЛАЧЕН').waitFor();
+const confirmBtn = owner.locator('div[role=dialog]').getByRole('button', { name: 'Да, аннулировать оплаченный счёт' });
+check(await confirmBtn.isDisabled(), 'без причины подтвердить нельзя');
+await owner.locator('div[role=dialog]').getByLabel('Причина').fill('тестовый счёт');
+await shot(owner, 'owner-void-paid-sheet');
+await confirmBtn.click();
+await owner.getByText('Счетов пока нет').waitFor();
+await tenant.reload();
+await tenant.getByRole('button', { name: 'Показания', exact: true }).click();
+await tenant.getByText('Текущее показание').first().waitFor();
+check(true, 'после аннулирования арендатор может ввести показания заново');
+await tenant.getByRole('button', { name: 'Главная' }).click();
+await tenant.getByText(/Срок передачи показаний: 25 октября 2026/).waitFor();
+check(true, 'на главной арендатора виден срок передачи');
+await shot(tenant, 'tenant-home-deadline');
+
 const dark = await openAs(1, 'dark');
 await dark.getByText('Квартира на Тверской').first().waitFor();
 await shot(dark, 'owner-home-dark');

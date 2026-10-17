@@ -360,6 +360,7 @@ async fn property_json(st: &ApiState, ctx: &Ctx, property_id: i64) -> Result<Val
         "name": name,
         "tenant_name": tenant_name,
         "tenant_connected": tenant_user.is_some(),
+        "reading_day": st.app.reading_day(property_id).await?,
         "registers": registers,
     });
     if matches!(ctx.role, Role::Landlord(_)) {
@@ -388,6 +389,8 @@ struct PropertyBody {
     /// `null` — водоотведение выключено.
     sewer_price: Option<String>,
     proof_required: Option<bool>,
+    /// День месяца 1–28, до которого арендатор передаёт показания; 0 — снять расписание.
+    reading_day: Option<i64>,
 }
 
 fn clean_text(v: &Option<String>) -> Option<String> {
@@ -493,13 +496,22 @@ async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> A
             if let Some(proof) = b.proof_required {
                 set_proof(&st, id, proof).await?;
             }
-            st.audit(&ctx, "property_update", "property", Some(id.to_string()), json!({ "name": b.name, "tenant_name": b.tenant_name, "proof_required": b.proof_required })).await;
+            set_schedule(&st, id, b.reading_day).await?;
+            st.audit(&ctx, "property_update", "property", Some(id.to_string()), json!({ "name": b.name, "tenant_name": b.tenant_name, "proof_required": b.proof_required, "reading_day": b.reading_day })).await;
             id
         }
     };
     Ok(Json(
         json!({ "property": property_json(&st, &ctx, id).await? }),
     ))
+}
+
+async fn set_schedule(st: &ApiState, property_id: i64, day: Option<i64>) -> Result<(), ApiError> {
+    match day {
+        None => Ok(()),
+        Some(0) => Ok(st.app.set_reading_day(property_id, None).await?),
+        Some(d) => Ok(st.app.set_reading_day(property_id, Some(d)).await?),
+    }
 }
 
 async fn set_proof(st: &ApiState, property_id: i64, on: bool) -> Result<(), ApiError> {
@@ -556,13 +568,22 @@ async fn home(State(st): St, ctx: Ctx) -> ApiResult {
         .fetch_optional(st.app.pool())
         .await?;
     let billed = st.app.period_billed(property_id, &period).await?;
+    // срок передачи показаний: по расписанию владельца, а без него — первое число следующего месяца
+    let reading_day = st.app.reading_day(property_id).await?;
+    let (first, _) = period_bounds(&period).ok_or(ApiError::Internal)?;
+    let next_month = period_of(first + Duration::days(32));
     let next_due = if billed {
-        let (first, _) = period_bounds(&period).ok_or(ApiError::Internal)?;
-        let next = first + Duration::days(32);
-        Some(format!("{}-01", period_of(next)))
+        Some(format!("{next_month}-{:02}", reading_day.unwrap_or(1)))
     } else {
         None
     };
+    let due_date = reading_day.map(|d| {
+        if billed {
+            format!("{next_month}-{d:02}")
+        } else {
+            format!("{period}-{d:02}")
+        }
+    });
     Ok(Json(json!({
         "role": ctx.role_name(),
         "property": { "name": name, "tenant_name": tenant_name, "tenant_connected": tenant_user.is_some() },
@@ -571,6 +592,8 @@ async fn home(State(st): St, ctx: Ctx) -> ApiResult {
         "total_registers": REGISTERS.len(),
         "billed": billed,
         "next_due": next_due,
+        "due_date": due_date,
+        "reading_day": reading_day,
         "last_bill": last.map(|(id, period, status, total)| json!({ "id": id, "period": period, "status": status, "total": total })),
     })))
 }
@@ -921,6 +944,7 @@ async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
     v["can_reject"] = json!(landlord && b.status == "draft");
     v["can_mark_paid"] = json!(landlord && b.status == "approved");
     v["can_reissue"] = json!(landlord && b.status == "approved");
+    v["can_void"] = json!(landlord && (b.status == "approved" || b.status == "paid"));
     Ok(Json(v))
 }
 
@@ -967,6 +991,38 @@ async fn bill_reject(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
 async fn bill_paid(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
     decide(&st, &ctx, id, "paid", "paid").await
 }
+#[derive(Deserialize)]
+struct VoidBody {
+    reason: String,
+    /// Счёт оплачен — аннулировать можно только при явном `true`.
+    #[serde(default)]
+    confirm_paid: bool,
+}
+
+async fn bill_void(
+    State(st): St,
+    ctx: Ctx,
+    Path(id): Path<i64>,
+    Json(b): Json<VoidBody>,
+) -> ApiResult {
+    ctx.landlord()?;
+    let before = bill_for(&st, &ctx, id).await?;
+    let reason = b.reason.trim();
+    if reason.is_empty() || reason.chars().count() > 200 {
+        return bad("Причина — от 1 до 200 символов.");
+    }
+    if before.status == "paid" && !b.confirm_paid {
+        return bad("Счёт оплачен: подтвердите аннулирование оплаченного счёта явно.");
+    }
+    let replies = st
+        .app
+        .void_bill(&ctx.sender, id, reason, before.status == "paid", st.now())
+        .await?;
+    let after = bill_for(&st, &ctx, id).await?;
+    st.notify_others(&ctx, replies).await;
+    Ok(Json(bill_summary(&after)))
+}
+
 async fn bill_reissue(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
     decide(&st, &ctx, id, "reissue", "void").await
 }
@@ -1017,6 +1073,7 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/bills/{id}/reject", post(bill_reject))
         .route("/bills/{id}/paid", post(bill_paid))
         .route("/bills/{id}/reissue", post(bill_reissue))
+        .route("/bills/{id}/void", post(bill_void))
         .route("/photos/{id}", get(reading_photo));
     let mut app = Router::new()
         .route("/healthz", get(healthz))

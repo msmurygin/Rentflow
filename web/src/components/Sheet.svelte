@@ -8,6 +8,7 @@
     confirmLabel,
     danger = false,
     busy = false,
+    disabled = false,
     onconfirm,
     oncancel,
     children,
@@ -17,6 +18,7 @@
     confirmLabel: string;
     danger?: boolean;
     busy?: boolean;
+    disabled?: boolean;
     onconfirm: () => void;
     oncancel: () => void;
     children?: Snippet;
@@ -36,7 +38,7 @@
     {#if text}<p class="mt-2 text-sm text-muted">{text}</p>{/if}
     {#if children}<div class="mt-3">{@render children()}</div>{/if}
     <div class="mt-5 grid gap-2">
-      <Btn variant={danger ? 'danger' : 'primary'} {busy} onclick={onconfirm}>{confirmLabel}</Btn>
+      <Btn variant={danger ? 'danger' : 'primary'} {busy} {disabled} onclick={onconfirm}>{confirmLabel}</Btn>
       <Btn variant="ghost" disabled={busy} onclick={oncancel}>{t('cancel')}</Btn>
     </div>
   </div>

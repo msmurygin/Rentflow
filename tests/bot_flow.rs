@@ -1632,24 +1632,46 @@ async fn duplicate_confirmation_voids_once_and_notifies_once() {
 }
 
 #[tokio::test]
-async fn paid_and_draft_bills_are_never_voided() {
+async fn a_paid_bill_is_voided_only_through_its_own_explicit_confirmation() {
     let (h, id) = H::approved_october().await;
     let now = at(2026, 10, 18);
-    // оплаченный: нет ни в списке, ни по прямому вызову
-    h.void_until_confirm(id, now).await; // состояние начато, пока счёт ещё утверждён
-    h.tap(LANDLORD, &format!("pd:{id}"), now).await; // оплата отмечена в промежутке
+    // 1. подтверждение, начатое для неоплаченного счёта, не срабатывает, если счёт оплатили в промежутке
+    h.void_until_confirm(id, now).await;
+    h.tap(LANDLORD, &format!("pd:{id}"), now).await;
     let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
-    assert!(
-        r[0].text.contains("уже изменён") || r[0].text.contains("устарело"),
-        "{r:?}"
-    );
+    assert!(r[0].text.contains("Статус счёта изменился"), "{r:?}");
     assert_eq!(h.status_of("2026-10").await, ["paid"]);
+    assert!(to_chat(&r, TENANT).is_empty());
+
+    // 2. оплаченный счёт виден в /void с пометкой, подтверждение содержит предупреждение
     let r = h.say(LANDLORD, "/void", now).await;
-    assert!(r[0].text.contains("Нет утверждённых"), "{r:?}");
-    let r = h.tap(LANDLORD, &format!("vo:{id}"), now).await;
-    assert!(r[0].text.contains("оплачен"), "{r:?}");
-    assert_eq!(h.status_of("2026-10").await, ["paid"]);
-    // арендатор команду не получает
+    assert!(r[0].buttons[0][0].label.contains("оплачен"), "{r:?}");
+    h.tap(LANDLORD, &format!("vo:{id}"), now).await;
+    let r = h.say(LANDLORD, "ошибочные показания", now).await;
+    assert!(r[0].text.contains("ОПЛАЧЕН"), "{r:?}");
+    assert!(r[0].buttons[0][0].label.contains("оплаченный"), "{r:?}");
+    assert_eq!(
+        h.status_of("2026-10").await,
+        ["paid"],
+        "до подтверждения ничего не изменилось"
+    );
+
+    // 3. подтверждение: счёт аннулирован, арендатор предупреждён об оплате, период открыт
+    let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(to_chat(&r, TENANT).contains("оплат"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["void"]);
+    let details: String =
+        sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'bill_void'")
+            .fetch_one(h.app.pool())
+            .await
+            .unwrap();
+    assert!(details.contains("\"was_paid\":true"), "{details}");
+    let r = h
+        .month(at(2026, 10, 19), ["756", "418", "3980", "1180"])
+        .await;
+    assert!(all_text(&r).contains("Расчёт за 2026-10"), "{r:?}");
+
+    // 4. арендатору команда недоступна
     let r = h.tap(TENANT, &format!("vc:{id}"), now).await;
     assert!(r[0].text.contains("недоступно"), "{r:?}");
 }
@@ -1661,4 +1683,123 @@ async fn void_of_a_draft_is_refused() {
     let r = h.tap(LANDLORD, &format!("vo:{id}"), at(2026, 10, 18)).await;
     assert!(r[0].text.contains("только утверждённый"), "{r:?}");
     assert_eq!(h.status_of("2026-10").await, ["draft"]);
+}
+
+// ---------- расписание и напоминания ----------
+
+async fn october_ready_with_schedule(day: &str) -> H {
+    let h = H::new().await;
+    h.setup(at(2026, 10, 15)).await;
+    h.connect_tenant(at(2026, 10, 15)).await;
+    let r = h
+        .say(LANDLORD, &format!("/schedule {day}"), at(2026, 10, 15))
+        .await;
+    assert!(r[0].text.contains("Срок передачи"), "{r:?}");
+    h
+}
+
+fn at_h(y: i32, m: u32, d: u32, hour: u32) -> NaiveDateTime {
+    at(y, m, d).date().and_hms_opt(hour, 0, 0).unwrap()
+}
+
+#[tokio::test]
+async fn schedule_command_validates_and_is_landlord_only() {
+    let h = H::new().await;
+    h.setup(at(2026, 10, 15)).await;
+    h.connect_tenant(at(2026, 10, 15)).await;
+    let now = at(2026, 10, 15);
+    for bad in [
+        "/schedule 0",
+        "/schedule 29",
+        "/schedule abc",
+        "/schedule -3",
+    ] {
+        let r = h.say(LANDLORD, bad, now).await;
+        assert!(
+            r[0].text.contains("1 до 28") || r[0].text.contains("число"),
+            "{bad}: {r:?}"
+        );
+    }
+    let r = h.say(LANDLORD, "/schedule", now).await;
+    assert!(r[0].text.contains("не задано"), "{r:?}");
+    h.say(LANDLORD, "/schedule 25", now).await;
+    let r = h.say(LANDLORD, "/schedule", now).await;
+    assert!(r[0].text.contains("25-го"), "{r:?}");
+    // арендатор расписание не меняет
+    h.say(TENANT, "/schedule 5", now).await;
+    let day: i64 = h.count("SELECT reading_day FROM property").await;
+    assert_eq!(day, 25);
+    h.say(LANDLORD, "/schedule off", now).await;
+    assert_eq!(h.count("SELECT count(reading_day) FROM property").await, 0);
+}
+
+#[tokio::test]
+async fn reminders_come_before_on_and_after_the_deadline_once_each() {
+    let h = october_ready_with_schedule("25").await;
+    let quiet = |r: &[Reply]| assert!(r.is_empty(), "{r:?}");
+    quiet(&h.app.due_reminders(at(2026, 10, 23)).await.unwrap());
+    quiet(&h.app.due_reminders(at_h(2026, 10, 24, 9)).await.unwrap()); // раньше 10:00 не шлём
+
+    let r = h.app.due_reminders(at_h(2026, 10, 24, 10)).await.unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].chat_id, TENANT * 100);
+    assert!(r[0].text.contains("Завтра (25.10)"), "{r:?}");
+    assert!(buttons(&r).contains(&"enter".to_string()));
+    quiet(&h.app.due_reminders(at_h(2026, 10, 24, 15)).await.unwrap()); // повтор в тот же день — тишина
+
+    let r = h.app.due_reminders(at(2026, 10, 25)).await.unwrap();
+    assert!(r[0].text.contains("Сегодня (25.10)"), "{r:?}");
+    let r = h.app.due_reminders(at(2026, 10, 26)).await.unwrap();
+    assert!(
+        r[0].text.contains("просрочены") && r[0].text.contains("1 дн."),
+        "{r:?}"
+    );
+    let r = h.app.due_reminders(at(2026, 10, 28)).await.unwrap();
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert!(
+        r.iter()
+            .any(|x| x.chat_id == TENANT * 100 && x.text.contains("3 дн."))
+    );
+    assert!(
+        r.iter()
+            .any(|x| x.chat_id == LANDLORD * 100 && x.text.contains("не передал"))
+    );
+    quiet(&h.app.due_reminders(at(2026, 10, 29)).await.unwrap()); // всё уже отправлено
+}
+
+#[tokio::test]
+async fn no_reminders_without_schedule_after_submission_or_without_a_tenant() {
+    // расписания нет
+    let h = H::new().await;
+    h.setup(at(2026, 10, 15)).await;
+    h.connect_tenant(at(2026, 10, 15)).await;
+    assert!(
+        h.app
+            .due_reminders(at(2026, 10, 25))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // показания отправлены — напоминать не о чем
+    h.say(LANDLORD, "/schedule 25", at(2026, 10, 15)).await;
+    h.month(at(2026, 10, 16), ["755", "417", "3975,48", "1179"])
+        .await;
+    assert!(
+        h.app
+            .due_reminders(at(2026, 10, 25))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // арендатор не подключён
+    let h = H::new().await;
+    h.setup(at(2026, 10, 15)).await;
+    h.say(LANDLORD, "/schedule 25", at(2026, 10, 15)).await;
+    assert!(
+        h.app
+            .due_reminders(at(2026, 10, 25))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

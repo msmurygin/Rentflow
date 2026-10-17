@@ -4,6 +4,7 @@
   import Badge from '../components/Badge.svelte';
   import Btn from '../components/Btn.svelte';
   import Card from '../components/Card.svelte';
+  import Field from '../components/Field.svelte';
   import Sheet from '../components/Sheet.svelte';
   import { api, errorText } from '../lib/api';
   import { dateLong, money, monthName, num, price } from '../lib/format';
@@ -33,7 +34,8 @@
   }
   onDestroy(() => urls.forEach((u) => URL.revokeObjectURL(u)));
 
-  type Act = 'approve' | 'reject' | 'paid' | 'reissue';
+  type Act = 'approve' | 'reject' | 'paid' | 'reissue' | 'void';
+  let reason = $state('');
   let ask = $state<Act | null>(null);
   let busy = $state(false);
 
@@ -42,17 +44,19 @@
     reject: { title: 'bills.reject', text: 'bills.rejectAsk', ok: 'bills.reject', danger: true },
     paid: { title: 'bills.paid', ok: 'bills.paid' },
     reissue: { title: 'bills.reissue', text: 'bills.reissueAsk', ok: 'bills.reissue' },
+    void: { title: 'bills.void', text: 'bills.voidAsk', ok: 'bills.void', danger: true },
   };
 
   async function run(act: Act) {
     busy = true;
     try {
-      await api.post(`/bills/${id}/${act}`);
+      if (act === 'void') await api.post(`/bills/${id}/void`, { reason, confirm_paid: l.data?.status === 'paid' });
+      else await api.post(`/bills/${id}/${act}`);
       tg.haptic('success');
       notify(t('bills.done'));
       ask = null;
       // после выпуска заново и отклонения этого счёта уже нет «в строю» — возвращаемся к списку
-      if (act === 'reissue' || act === 'reject') go('bills');
+      if (act === 'reissue' || act === 'reject' || act === 'void') go('bills');
       else await l.reload();
     } catch (e) {
       notify(errorText(e, t('genericError'), t('offline')), 'err');
@@ -132,14 +136,19 @@
         {#if b.can_mark_paid}<Btn onclick={() => (ask = 'paid')}>{t('bills.paid')}</Btn>{/if}
         {#if b.can_reissue}<Btn variant="secondary" onclick={() => (ask = 'reissue')}>{t('bills.reissue')}</Btn>{/if}
         {#if b.can_reject}<Btn variant="danger" onclick={() => (ask = 'reject')}>{t('bills.reject')}</Btn>{/if}
+        {#if b.can_void}<Btn variant="danger" onclick={() => { reason = ''; ask = 'void'; }}>{t('bills.void')}</Btn>{/if}
       </div>
     </div>
 
     {#if ask}
       {@const c = texts[ask]}
       {@const act = ask}
-      <Sheet title={t(c.title)} text={c.text ? t(c.text) : ''} confirmLabel={t(c.ok)} danger={c.danger} {busy} onconfirm={() => run(act)} oncancel={() => (ask = null)}>
+      <Sheet title={t(c.title)} text={c.text ? t(c.text) : ''} confirmLabel={act === 'void' && b.status === 'paid' ? t('bills.voidPaidConfirm') : t(c.ok)} danger={c.danger} busy={busy} disabled={act === 'void' && !reason.trim()} onconfirm={() => run(act)} oncancel={() => (ask = null)}>
         <p class="num text-2xl font-bold">{money(b.total)}</p>
+        {#if act === 'void'}
+          {#if b.status === 'paid'}<p class="mt-2 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">{t('bills.voidPaid')}</p>{/if}
+          <div class="mt-3"><Field label={t('bills.voidReason')} bind:value={reason} /></div>
+        {/if}
       </Sheet>
     {/if}
     {#if zoom}
