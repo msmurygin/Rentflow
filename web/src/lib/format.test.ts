@@ -25,6 +25,14 @@ describe('format', () => {
     expect(usage('3975.48', '3831')).toBe('144');
     expect(usage('3975.99', '3831.99')).toBe('144');
   });
+  it('usage never throws on comma decimals, spaces or garbage', () => {
+    expect(usage('125', '0,5')).toBe('125');
+    expect(usage('3975,48', '3831')).toBe('144');
+    expect(usage('3 975', '3 831')).toBe('144');
+    expect(usage('10', '')).toBe('—');
+    expect(usage('abc', '1')).toBe('—');
+    expect(usage('1e5', '1')).toBe('—');
+  });
   it('validates typed numbers', () => {
     expect(isValidNumber('761,5')).toBe(true);
     expect(isValidNumber('761.5')).toBe(true);
