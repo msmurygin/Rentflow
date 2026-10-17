@@ -16,6 +16,7 @@ const OLD: [&str; 7] = [
     include_str!("../migrations/0007_reading_schedule.sql"),
 ];
 const NEW: &str = include_str!("../migrations/0008_membership.sql");
+const SELF_SERVICE: &str = include_str!("../migrations/0009_selfservice.sql");
 
 async fn legacy() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -88,6 +89,7 @@ async fn existing_owner_tenant_and_bills_survive_with_the_same_ids() {
 async fn after_migration_the_old_owner_works_without_any_telegram_id_config_and_strangers_do_not() {
     let pool = legacy().await;
     sqlx::raw_sql(NEW).execute(&pool).await.unwrap();
+    sqlx::raw_sql(SELF_SERVICE).execute(&pool).await.unwrap();
     let app = App::new(
         pool,
         Config {
@@ -140,4 +142,30 @@ async fn after_migration_the_old_owner_works_without_any_telegram_id_config_and_
             "{id}: чужой счёт в списке: {r:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn existing_registers_stay_enabled_after_the_self_service_migration() {
+    let pool = legacy().await;
+    sqlx::raw_sql(NEW).execute(&pool).await.unwrap();
+    sqlx::raw_sql(SELF_SERVICE).execute(&pool).await.unwrap();
+    let rows: Vec<(String, i64, Option<String>)> =
+        sqlx::query_as("SELECT code, enabled, meter_group FROM register ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("cold".to_string(), 1, Some("cold".to_string())),
+            ("hot".to_string(), 1, Some("hot".to_string())),
+            ("t1".to_string(), 1, Some("electricity".to_string())),
+            ("t2".to_string(), 1, Some("electricity".to_string())),
+        ]
+    );
+    let tz: i64 = sqlx::query_scalar("SELECT tz_offset_hours FROM property WHERE id = 3")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tz, 3, "существующая московская квартира получает +3");
 }

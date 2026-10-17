@@ -342,6 +342,24 @@ impl App {
     }
 
     /// Объект арендатора из контекста пользователя. Для владельца этой функции быть не должно.
+    /// Включённые регистры объекта в каноническом порядке (ХВС, ГВС, T1, T2). Всё, что раньше перебирало
+    /// фиксированный список из четырёх, теперь берёт его отсюда.
+    pub(crate) async fn registers_of(
+        &self,
+        property_id: i64,
+    ) -> Res<Vec<(&'static str, &'static str, &'static str)>> {
+        let on: Vec<String> =
+            sqlx::query_scalar("SELECT code FROM register WHERE property_id = ? AND enabled = 1")
+                .bind(property_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(crate::util::REGISTERS
+            .iter()
+            .filter(|r| on.iter().any(|c| c == r.0))
+            .copied()
+            .collect())
+    }
+
     pub(crate) fn tenant_property(&self, u: &UserRow) -> Res<i64> {
         match u.property_id {
             Some(p) => Ok(p),

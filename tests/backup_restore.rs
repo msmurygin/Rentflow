@@ -55,6 +55,7 @@ async fn live() -> (App, PathBuf, PathBuf) {
                     .map(|c| (c.to_string(), "2".to_string()))
                     .to_vec(),
                 sewer_price: Some("3".into()),
+                ..Default::default()
             },
             now(),
         )

@@ -108,7 +108,8 @@ impl App {
             let period = self.open_period(property_id, now).await?;
             // показания уже отправлены (идёт расчёт) — напоминать нечего
             if self.period_billed(property_id, &period).await?
-                || self.received(property_id, &period).await?.len() >= REGISTERS.len()
+                || self.received(property_id, &period).await?.len()
+                    >= self.registers_of(property_id).await?.len()
             {
                 continue;
             }

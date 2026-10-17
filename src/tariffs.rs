@@ -496,7 +496,8 @@ impl App {
             ));
         }
         let period = self.open_period(property_id, now).await?;
-        let waiting = self.received(property_id, &period).await?.len() == 4
+        let waiting = self.received(property_id, &period).await?.len()
+            == self.registers_of(property_id).await?.len()
             && !self.period_billed(property_id, &period).await?;
         let mut replies = vec![if waiting {
             Reply::with_buttons(

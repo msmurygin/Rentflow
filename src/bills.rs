@@ -129,7 +129,7 @@ impl App {
     pub(crate) async fn compute_draft(&self, property_id: i64, period: &str) -> Res<Snapshot> {
         let mut inputs = Vec::with_capacity(4);
         let mut prev_dates: Vec<Option<String>> = Vec::new();
-        for (code, _, _) in REGISTERS {
+        for (code, _, _) in self.registers_of(property_id).await? {
             let register_id: i64 =
                 sqlx::query_scalar("SELECT id FROM register WHERE property_id = ? AND code = ?")
                     .bind(property_id)
@@ -303,8 +303,9 @@ impl App {
         .bind(&d.snapshot.period)
         .fetch_all(&self.pool)
         .await?;
+        let regs = self.registers_of(property_id).await?;
         let mut photos = vec![];
-        for (code, _, _) in REGISTERS {
+        for (code, _, _) in regs.iter().copied() {
             if let Some((_, file_id)) = rows.iter().find(|r| r.0 == code) {
                 let value = d
                     .snapshot
@@ -319,10 +320,10 @@ impl App {
         }
         let proof_note = match photos.len() {
             0 => "Фото к показаниям не приложены.".to_string(),
-            n if n == REGISTERS.len() => "Фото-подтверждения всех показаний — выше.".to_string(),
+            n if n == regs.len() => "Фото-подтверждения всех показаний — выше.".to_string(),
             n => format!(
                 "Фото-подтверждения приложены к {n} из {} показаний (выше).",
-                REGISTERS.len()
+                regs.len()
             ),
         };
         let mut reply = Reply::with_buttons(

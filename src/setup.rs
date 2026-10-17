@@ -91,6 +91,7 @@ fn answer<'a>(answers: &'a [String], key: &str) -> &'a str {
 }
 
 /// Всё, что нужно для первой настройки объекта: общий вход для мастера `/setup` и для Mini App.
+#[derive(Default)]
 pub struct NewProperty {
     pub name: String,
     pub tenant_name: String,
@@ -102,6 +103,10 @@ pub struct NewProperty {
     pub prices: Vec<(String, String)>,
     /// `None` — водоотведение выключено.
     pub sewer_price: Option<String>,
+    /// Отключённые регистры (например, `t2` при однотарифном счётчике): ни показаний, ни тарифов по ним нет.
+    pub disabled: Vec<String>,
+    /// Часовой пояс объекта — сдвиг от UTC в часах.
+    pub tz_offset_hours: Option<i64>,
 }
 
 impl App {
@@ -117,10 +122,11 @@ impl App {
         let month = period_of(now.date());
         let mut tx = self.pool.begin().await?;
         let property_id =
-            sqlx::query("INSERT INTO property (landlord_id, name, created_at) VALUES (?, ?, ?)")
+            sqlx::query("INSERT INTO property (landlord_id, name, created_at, tz_offset_hours) VALUES (?, ?, ?, ?)")
                 .bind(landlord_id)
                 .bind(&np.name)
                 .bind(&ts)
+                .bind(np.tz_offset_hours.unwrap_or(3))
                 .execute(&mut *tx)
                 .await?
                 .last_insert_rowid();
@@ -143,21 +149,38 @@ impl App {
         let find = |list: &[(String, String)], code: &str| {
             list.iter().find(|x| x.0 == code).map(|x| x.1.clone())
         };
+        if REGISTERS
+            .iter()
+            .all(|r| np.disabled.iter().any(|d| d == r.0))
+        {
+            return user_err("Включите хотя бы один счётчик.");
+        }
         for (code, lbl, unit) in REGISTERS {
-            let (Some(base), Some(price)) = (find(&np.baselines, code), find(&np.prices, code))
-            else {
-                return user_err("Не хватает стартового показания или тарифа.");
+            let group = if code.starts_with('t') {
+                "electricity"
+            } else {
+                code
             };
+            let enabled = !np.disabled.iter().any(|d| d == code);
             let register_id = sqlx::query(
-                "INSERT INTO register (property_id, code, label, unit) VALUES (?, ?, ?, ?)",
+                "INSERT INTO register (property_id, code, label, unit, enabled, meter_group) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(property_id)
             .bind(code)
             .bind(lbl)
             .bind(unit)
+            .bind(enabled)
+            .bind(group)
             .execute(&mut *tx)
             .await?
             .last_insert_rowid();
+            if !enabled {
+                continue; // отключённый регистр: нет ни начального показания, ни тарифа
+            }
+            let (Some(base), Some(price)) = (find(&np.baselines, code), find(&np.prices, code))
+            else {
+                return user_err("Не хватает стартового показания или тарифа.");
+            };
             // Стартовое показание — якорь для первого расчёта; начислений за прошлое оно не создаёт.
             sqlx::query(
                 "INSERT INTO reading (register_id, period, kind, value, read_on, source, status, confirmed_by, created_at)
@@ -337,6 +360,7 @@ impl App {
                 "no" => None,
                 price => Some(price.to_string()),
             },
+            ..Default::default()
         };
         self.create_property(u.id, &np, now).await?;
         self.clear_state(from.telegram_id).await?;

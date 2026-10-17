@@ -401,7 +401,7 @@ async fn property_json(st: &ApiState, ctx: &Ctx, property_id: i64) -> Result<Val
     let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT g.code, g.label, g.unit, r.value, r.read_on FROM register g
            JOIN reading r ON r.register_id = g.id AND r.kind = 'baseline' AND r.status = 'confirmed'
-          WHERE g.property_id = ?",
+          WHERE g.property_id = ? AND g.enabled = 1",
     )
     .bind(property_id)
     .fetch_all(st.app.pool())
@@ -461,6 +461,10 @@ struct PropertyBody {
     proof_required: Option<bool>,
     /// День месяца 1–28, до которого арендатор передаёт показания; 0 — снять расписание.
     reading_day: Option<i64>,
+    /// Отключённые регистры (`t2`, `hot` …): по ним не нужны ни показания, ни тарифы.
+    disabled: Option<Vec<String>>,
+    /// Часовой пояс объекта: сдвиг от UTC в часах (−12…14).
+    tz_offset_hours: Option<i64>,
 }
 
 fn clean_text(v: &Option<String>) -> Option<String> {
@@ -497,9 +501,8 @@ async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<
         let Some(name) = clean_text(&b.name) else {
             return bad("Укажите название квартиры.");
         };
-        let Some(tenant_name) = clean_text(&b.tenant_name) else {
-            return bad("Укажите имя арендатора.");
-        };
+        // имя арендатора можно узнать позже: до приглашения это просто подпись
+        let tenant_name = clean_text(&b.tenant_name).unwrap_or_else(|| "Арендатор".to_string());
         let base_date = match b
             .base_date
             .as_deref()
@@ -513,8 +516,28 @@ async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<
                     .to_string(),
             ),
         };
-        let reg = ["cold", "hot", "t1", "t2"];
+        let disabled: Vec<String> = b.disabled.clone().unwrap_or_default();
+        if disabled
+            .iter()
+            .any(|d| !["cold", "hot", "t1", "t2"].contains(&d.as_str()))
+        {
+            return bad("Неизвестный счётчик в списке отключённых.");
+        }
+        if let Some(tz) = b.tz_offset_hours
+            && !(-12..=14).contains(&tz)
+        {
+            return bad("Часовой пояс: от −12 до +14.");
+        }
+        let reg: Vec<&str> = ["cold", "hot", "t1", "t2"]
+            .into_iter()
+            .filter(|c| !disabled.iter().any(|d| d == c))
+            .collect();
+        if reg.is_empty() {
+            return bad("Включите хотя бы один счётчик.");
+        }
         let np = NewProperty {
+            disabled,
+            tz_offset_hours: b.tz_offset_hours,
             name,
             tenant_name,
             base_date,
@@ -698,7 +721,7 @@ async fn home(State(st): St, ctx: Ctx) -> ApiResult {
         "property": { "name": name, "tenant_name": tenant_name, "tenant_connected": tenant_user.is_some() },
         "period": period,
         "received": received,
-        "total_registers": REGISTERS.len(),
+        "total_registers": st.app.registers_of(property_id).await?.len(),
         "billed": billed,
         "next_due": next_due,
         "due_date": due_date,
@@ -713,7 +736,7 @@ async fn meters(State(st): St, ctx: Ctx) -> ApiResult {
     };
     let period = st.app.open_period(property_id, st.now()).await?;
     let mut out = vec![];
-    for (code, lbl, unit) in REGISTERS {
+    for (code, lbl, unit) in st.app.registers_of(property_id).await? {
         let last: Option<(String, Option<String>, String)> = sqlx::query_as(
             "SELECT r.value, r.read_on, r.period FROM reading r JOIN register g ON g.id = r.register_id
               WHERE g.property_id = ? AND g.code = ? AND r.status = 'confirmed' AND r.period < ?
@@ -1168,6 +1191,146 @@ async fn reading_photo(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> Result<R
     read_photo(path).await
 }
 
+// ---------- самостоятельная настройка: черновик мастера, приглашение из приложения ----------
+
+/// Пользователь — зарегистрированный собственник (есть сессия и роль), но объекта в контексте может и не быть.
+fn owner_user(ctx: &Ctx) -> Result<&UserRow, ApiError> {
+    ctx.landlord()
+}
+
+async fn setup_draft_get(State(st): St, ctx: Ctx) -> ApiResult {
+    let u = owner_user(&ctx)?;
+    let row: Option<(i64, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT step, data, property_id, updated_at FROM property_draft WHERE user_id = ?",
+    )
+    .bind(u.id)
+    .fetch_optional(st.app.pool())
+    .await?;
+    Ok(Json(
+        json!({ "draft": row.map(|(step, data, property_id, updated_at)| json!({
+        "step": step,
+        "data": serde_json::from_str::<Value>(&data).unwrap_or(json!({})),
+        "property_id": property_id,
+        "updated_at": updated_at,
+    })) }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DraftBody {
+    step: i64,
+    data: Value,
+}
+
+/// Сохраняет шаг мастера. Ничего, кроме черновика, не создаётся: повторные «Далее» не плодят квартиры.
+async fn setup_draft_put(State(st): St, ctx: Ctx, Json(b): Json<DraftBody>) -> ApiResult {
+    let u = owner_user(&ctx)?;
+    if !(0..=10).contains(&b.step) || !b.data.is_object() {
+        return bad("Некорректный шаг мастера.");
+    }
+    let data = b.data.to_string();
+    if data.len() > 8 * 1024 {
+        return bad("Слишком большой черновик.");
+    }
+    // завершённый черновик (квартира уже создана) начинается заново — это новая квартира
+    sqlx::query(
+        "INSERT INTO property_draft (user_id, step, data, property_id, updated_at) VALUES (?1, ?2, ?3, NULL, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET step = ?2, data = ?3, updated_at = ?4,
+             property_id = NULL, claimed = 0",
+    )
+    .bind(u.id)
+    .bind(b.step)
+    .bind(data)
+    .bind(now_iso(st.now()))
+    .execute(st.app.pool())
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// «Готово»: создаёт квартиру из черновика ровно один раз (повтор и параллельный запрос получают ту же квартиру).
+async fn setup_finish(State(st): St, ctx: Ctx) -> ApiResult {
+    let u = owner_user(&ctx)?;
+    let row: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT data, property_id FROM property_draft WHERE user_id = ?")
+            .bind(u.id)
+            .fetch_optional(st.app.pool())
+            .await?;
+    let Some((data, done)) = row else {
+        return bad("Мастер ещё не начат.");
+    };
+    if let Some(id) = done {
+        return Ok(Json(json!({ "property_id": id, "already": true })));
+    }
+    // атомарно занимаем завершение: второй параллельный запрос получит 0 строк
+    let claimed = sqlx::query(
+        "UPDATE property_draft SET claimed = 1 WHERE user_id = ? AND property_id IS NULL AND claimed = 0",
+    )
+    .bind(u.id)
+    .execute(st.app.pool())
+    .await?;
+    if claimed.rows_affected() != 1 {
+        return Err(ApiError::Conflict(
+            "Квартира уже создаётся — подождите секунду.".into(),
+        ));
+    }
+    let body: PropertyBody = match serde_json::from_str(&data) {
+        Ok(b) => b,
+        Err(_) => {
+            sqlx::query("UPDATE property_draft SET claimed = 0 WHERE user_id = ?")
+                .bind(u.id)
+                .execute(st.app.pool())
+                .await?;
+            return bad("Черновик повреждён — начните заново.");
+        }
+    };
+    match create_from_body(&st, &ctx, &body).await {
+        Ok(id) => {
+            sqlx::query("UPDATE property_draft SET property_id = ?, claimed = 0 WHERE user_id = ?")
+                .bind(id)
+                .bind(u.id)
+                .execute(st.app.pool())
+                .await?;
+            st.app.set_active_property(u.id, id).await?;
+            Ok(Json(json!({ "property_id": id, "already": false })))
+        }
+        Err(e) => {
+            // не получилось (например, не хватает показаний) — черновик остаётся, можно исправить и повторить
+            sqlx::query("UPDATE property_draft SET claimed = 0 WHERE user_id = ?")
+                .bind(u.id)
+                .execute(st.app.pool())
+                .await?;
+            Err(e)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AcceptBody {
+    token: String,
+}
+
+/// Арендатор принимает приглашение из приложения (ссылка `startapp`) — то же действие, что `/start <токен>` в боте.
+async fn invitation_accept(
+    State(st): St,
+    AnySession(sender): AnySession,
+    Json(b): Json<AcceptBody>,
+) -> ApiResult {
+    let now = st.now();
+    let who = st.app.who(&sender, now).await?;
+    let replies = st
+        .app
+        .accept_invite(&sender, &who, b.token.trim(), now)
+        .await?;
+    let others: Vec<Reply> = replies
+        .into_iter()
+        .filter(|r| r.chat_id != sender.chat_id)
+        .collect();
+    if !others.is_empty() {
+        st.notifier.send(others).await;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -1196,6 +1359,9 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/property", get(get_property).put(put_property))
         .route("/properties", get(list_properties).post(post_property))
         .route("/invitations", post(create_invitation))
+        .route("/invitations/accept", post(invitation_accept))
+        .route("/setup/draft", get(setup_draft_get).put(setup_draft_put))
+        .route("/setup/finish", post(setup_finish))
         .route("/meters", get(meters))
         .route(
             "/readings/draft",

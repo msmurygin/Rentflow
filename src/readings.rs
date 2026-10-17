@@ -86,8 +86,6 @@ pub struct FormView {
     pub complete: bool,
 }
 
-const TOTAL: usize = REGISTERS.len();
-
 impl App {
     pub(crate) async fn landlord_chat(&self, property_id: i64) -> Res<i64> {
         Ok(sqlx::query_scalar("SELECT l.chat_id FROM property p JOIN app_user l ON l.id = p.landlord_id WHERE p.id = ?")
@@ -142,10 +140,14 @@ impl App {
         .await?)
     }
 
-    pub(crate) fn status_text(period: &str, got: &[(String, String)]) -> String {
+    pub(crate) fn status_text(
+        period: &str,
+        got: &[(String, String)],
+        regs: &[(&str, &str, &str)],
+    ) -> String {
         let mut lines = vec![format!("Период {period}")];
         let mut missing = vec![];
-        for (code, lbl, unit) in REGISTERS {
+        for (code, lbl, unit) in regs.iter().copied() {
             match got.iter().find(|g| g.0 == code) {
                 Some((_, v)) => lines.push(format!(
                     "✅ {lbl}: {} {unit}",
@@ -175,7 +177,8 @@ impl App {
         let period = self.open_period(property_id, now).await?;
         let got = self.received(property_id, &period).await?;
         let drafts = self.load_drafts(u.id, &period).await?;
-        let mut text = Self::status_text(&period, &got);
+        let regs = self.registers_of(property_id).await?;
+        let mut text = Self::status_text(&period, &got, &regs);
         if self.period_billed(property_id, &period).await? {
             text.push_str("\nПо этому периоду расчёт уже отправлен владельцу.");
         } else if !drafts.is_empty() {
@@ -225,7 +228,7 @@ impl App {
             } else {
                 "выключено"
             },
-            Self::status_text(&period, &got)
+            Self::status_text(&period, &got, &self.registers_of(property_id).await?)
         );
         let proof = self.proof_required(property_id).await?;
         text.push_str(&format!(
@@ -549,6 +552,20 @@ impl App {
         Ok(existing.is_some())
     }
 
+    /// Показания принимаются только по включённым регистрам объекта.
+    async fn require_enabled(&self, property_id: i64, code: &str) -> Res<()> {
+        if self
+            .registers_of(property_id)
+            .await?
+            .iter()
+            .any(|r| r.0 == code)
+        {
+            Ok(())
+        } else {
+            user_err("Этот счётчик у квартиры отключён.")
+        }
+    }
+
     /// Это фото уже учтено (подтверждённым показанием или открытой формой)?
     async fn photo_used(&self, unique_id: &str) -> Res<bool> {
         let used: i64 = sqlx::query_scalar(
@@ -568,7 +585,7 @@ impl App {
         let period = self.open_period(property_id, now).await?;
         let billed = self.period_billed(property_id, &period).await?;
         let mut registers = vec![];
-        for (code, lbl, unit) in REGISTERS {
+        for (code, lbl, unit) in self.registers_of(property_id).await? {
             let row = self.existing_row(user_id, &period, code).await?;
             registers.push(FormRegister {
                 code: code.into(),
@@ -612,6 +629,7 @@ impl App {
         }
         let user_id = u.id;
         let property_id = self.tenant_property(u)?;
+        self.require_enabled(property_id, code).await?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -645,6 +663,7 @@ impl App {
         }
         let user_id = u.id;
         let property_id = self.tenant_property(u)?;
+        self.require_enabled(property_id, code).await?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -753,7 +772,8 @@ impl App {
         code: &str,
         edit: bool,
     ) -> Res<Reply> {
-        let idx = REGISTERS.iter().position(|r| r.0 == code).unwrap_or(0);
+        let regs = self.registers_of(property_id).await?;
+        let idx = regs.iter().position(|r| r.0 == code).unwrap_or(0);
         let prev = match self.previous_value(property_id, code, period).await? {
             Some(p) => format!("Прошлое показание: {} {}", num(p), unit(code)),
             None => "Прошлого показания нет".to_string(),
@@ -761,7 +781,7 @@ impl App {
         let head = if edit {
             format!("✏️ {}", label(code))
         } else {
-            format!("Шаг {} из {TOTAL} — {}", idx + 1, label(code))
+            format!("Шаг {} из {} — {}", idx + 1, regs.len(), label(code))
         };
         let proof = if self.proof_required(property_id).await? {
             "\n📎 К показанию нужно приложить фото счётчика — пришлите его до или после числа."
@@ -788,7 +808,7 @@ impl App {
         let required = self.proof_required(property_id).await?;
         let mut lines = vec![format!("Проверьте показания за {period}:\n")];
         let mut no_photo = vec![];
-        for (code, lbl, unit) in REGISTERS {
+        for (code, lbl, unit) in self.registers_of(property_id).await? {
             let Some(d) = drafts.iter().find(|d| d.code == code) else {
                 continue;
             };
@@ -848,10 +868,8 @@ impl App {
         if let Some(text) = lead.filter(|t| !t.is_empty()) {
             replies.push(Reply::text(from.chat_id, text));
         }
-        match REGISTERS
-            .iter()
-            .find(|r| !drafts.iter().any(|d| d.code == r.0))
-        {
+        let regs = self.registers_of(property_id).await?;
+        match regs.iter().find(|r| !drafts.iter().any(|d| d.code == r.0)) {
             Some((code, _, _)) => {
                 self.set_state(
                     from.telegram_id,
@@ -884,7 +902,7 @@ impl App {
         if edit {
             self.clear_state(from.telegram_id).await?;
             let drafts = self.load_drafts(user_id, period).await?;
-            if drafts.len() == TOTAL {
+            if drafts.len() == self.registers_of(property_id).await?.len() {
                 let mut replies = vec![Reply::text(from.chat_id, lead)];
                 replies.push(self.summary(from, property_id, period, &drafts).await?);
                 return Ok(replies);
@@ -1277,7 +1295,11 @@ impl App {
         let mut notes = vec![];
         let mut photo_attached = false;
         for c in candidates.iter().take(2) {
-            let code = c.register.clone().filter(|r| is_register(r));
+            let enabled = self.registers_of(property_id).await?;
+            let code = c
+                .register
+                .clone()
+                .filter(|r| enabled.iter().any(|e| e.0 == r.as_str()));
             let value = c.value.as_deref().and_then(parse_decimal);
             let (Some(code), Some(value)) = (code, value) else {
                 notes.push("⚠️ На фото не удалось надёжно определить счётчик или цифры — введите это показание вручную.".to_string());
@@ -1357,8 +1379,10 @@ impl App {
                 "Нечего отправлять. Начните ввод: /enter",
             )]);
         }
-        let missing: Vec<&str> = REGISTERS
-            .iter()
+        let missing: Vec<&str> = self
+            .registers_of(property_id)
+            .await?
+            .into_iter()
             .filter(|r| !drafts.iter().any(|d| d.code == r.0))
             .map(|r| r.1)
             .collect();
@@ -1476,10 +1500,11 @@ impl App {
             return user_err(format!("По периоду {period} счёт уже есть: /status"));
         }
         let got = self.received(property_id, &period).await?;
-        if got.len() < TOTAL {
+        let regs = self.registers_of(property_id).await?;
+        if got.len() < regs.len() {
             return user_err(format!(
                 "Показания неполные.\n\n{}",
-                Self::status_text(&period, &got)
+                Self::status_text(&period, &got, &regs)
             ));
         }
         let draft = self.create_draft(property_id, &period, now).await?;
