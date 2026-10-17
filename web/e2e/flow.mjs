@@ -16,6 +16,11 @@ const check = (c, m) => { if (!c) fail(m); console.log('ok:', m); };
 async function openAs(userId, scheme = 'light') {
   const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: scheme });
   const initData = await (await fetch(`${BASE}/dev/init?user=${userId}`)).text();
+  if (userId === 1) {
+    // владелец регистрируется сам (как в продукте): вход через Telegram + регистрация
+    const t = (await (await fetch(`${BASE}/api/auth/telegram`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ init_data: initData }) })).json()).token;
+    await fetch(`${BASE}/api/register`, { method: 'POST', headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' }, body: '{}' });
+  }
   // настоящий telegram-web-app.js вне Telegram затёр бы заглушку — не даём ему загрузиться
   await ctx.route('**/telegram-web-app.js', (r) => r.abort());
   await ctx.addInitScript(({ initData, scheme }) => {

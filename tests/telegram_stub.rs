@@ -168,11 +168,18 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
     let (url, log) = start_stub(updates).await;
 
     let pool = db::connect("sqlite::memory:").await.unwrap();
-    sqlx::query("INSERT INTO app_user (telegram_id, chat_id, role, created_at) VALUES (888, 888, 'tenant', 'x')").execute(&pool).await.unwrap();
+    // арендатор 888 — участник чужой (для теста) квартиры: права берутся из membership
+    sqlx::query("INSERT INTO app_user (id, telegram_id, chat_id, role, created_at) VALUES (1, 887, 887, 'landlord', 'x'), (2, 888, 888, 'tenant', 'x')").execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO property (id, landlord_id, name, created_at) VALUES (1, 1, 'Кв', 'x')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO membership (user_id, property_id, role, created_at) VALUES (1, 1, 'owner', 'x'), (2, 1, 'tenant', 'x')").execute(&pool).await.unwrap();
     let app = Arc::new(App::new(
         pool,
         Config {
-            landlord_telegram_id: 1,
             bot_username: "rentflow_bot".into(),
             photo_dir: None,
             invite_ttl_days: 7,
@@ -217,7 +224,7 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
         log.paths
     );
     assert!(
-        texts.iter().any(|t| t.contains("не подключены")),
+        texts.iter().any(|t| t.contains("ссылку-приглашение")),
         "{texts:?}"
     );
     // кнопка: ответ на нажатие и снятие клавиатуры

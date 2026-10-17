@@ -31,7 +31,6 @@ async fn live() -> (App, PathBuf, PathBuf) {
     let app = App::new(
         pool.clone(),
         Config {
-            landlord_telegram_id: 1,
             photo_dir: Some(photos.clone()),
             ..Default::default()
         },

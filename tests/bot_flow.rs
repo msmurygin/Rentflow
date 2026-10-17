@@ -76,7 +76,6 @@ impl H {
         let app = App::new(
             pool,
             Config {
-                landlord_telegram_id: LANDLORD,
                 bot_username: "rentflow_bot".into(),
                 photo_dir,
                 invite_ttl_days: 7,
@@ -266,11 +265,26 @@ async fn wizard_shows_progress_rejects_bad_input_and_asks_again() {
 }
 
 #[tokio::test]
-async fn only_the_configured_landlord_can_setup() {
+async fn a_newcomer_becomes_an_owner_only_by_asking() {
     let h = H::new().await;
+    // обычное сообщение — приветствие с выбором, пользователь не создаётся
+    let r = h.say(STRANGER, "привет", at(2026, 6, 26)).await;
+    assert!(buttons(&r).contains(&"reg_owner".to_string()), "{r:?}");
+    assert_eq!(h.count("SELECT count(*) FROM app_user").await, 0);
+    // /setup — самостоятельная регистрация владельцем и начало мастера
     let r = h.say(STRANGER, "/setup", at(2026, 6, 26)).await;
-    assert!(r[0].text.contains("не подключены"), "{r:?}");
-    assert_eq!(h.count("SELECT count(*) FROM property").await, 0);
+    assert!(r[0].text.contains("Настройка объекта"), "{r:?}");
+    assert_eq!(
+        h.count("SELECT count(*) FROM app_user WHERE role = 'landlord'")
+            .await,
+        1
+    );
+    // у него ещё нет ни объектов, ни чужих данных
+    let r = h.say(STRANGER, "/status", at(2026, 6, 26)).await;
+    assert!(
+        r[0].text.contains("не настроен") || r[0].text.contains("/setup"),
+        "{r:?}"
+    );
 }
 
 // ---------- приглашение ----------
@@ -685,6 +699,10 @@ async fn tenant_cannot_touch_another_tenants_property_or_forms() {
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO membership (user_id, property_id, role, created_at) VALUES (50, 9, 'owner', 'x'), (51, 9, 'tenant', 'x')")
+        .execute(pool)
+        .await
+        .unwrap();
     for c in ["cold", "hot", "t1", "t2"] {
         sqlx::query("INSERT INTO register (property_id, code, label, unit) VALUES (9, ?, ?, 'u')")
             .bind(c)
@@ -720,9 +738,9 @@ async fn tenant_cannot_touch_another_tenants_property_or_forms() {
 
     // посторонний без приглашения не может отправлять показания и фото
     let r = h.photo(STRANGER, "X1", now).await;
-    assert!(r[0].text.contains("не подключены"), "{r:?}");
+    assert!(r[0].text.contains("ссылку-приглашение"), "{r:?}");
     let r = h.say(STRANGER, "/enter", now).await;
-    assert!(r[0].text.contains("не подключены"), "{r:?}");
+    assert!(r[0].text.contains("ссылку-приглашение"), "{r:?}");
 }
 
 // ---------- фото, дубли, ошибки распознавания ----------

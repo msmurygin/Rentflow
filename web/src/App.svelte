@@ -31,7 +31,8 @@
     try {
       await login();
       session.me = await api.get<Me>('/me');
-      boot = 'ready';
+      // самостоятельная регистрация — экраны появятся в следующем этапе; пока незнакомцу нужен инвайт
+      boot = session.me.role === 'new' ? 'denied' : 'ready';
     } catch (e) {
       boot = e instanceof ApiError && e.status === 403 ? 'denied' : 'error';
     }

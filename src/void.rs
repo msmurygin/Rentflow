@@ -9,7 +9,7 @@ use chrono::NaiveDateTime;
 impl App {
     pub(crate) async fn void_list(&self, from: &Sender) -> Res<Vec<Reply>> {
         let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
-            "SELECT b.id, b.period, b.total, b.status FROM bill b JOIN property p ON p.id = b.property_id JOIN app_user l ON l.id = p.landlord_id
+            "SELECT b.id, b.period, b.total, b.status FROM bill b JOIN membership m ON m.property_id = b.property_id AND m.role = 'owner' JOIN app_user l ON l.id = m.user_id
               WHERE b.status IN ('approved', 'paid') AND l.telegram_id = ? ORDER BY b.period",
         )
         .bind(from.telegram_id)

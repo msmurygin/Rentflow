@@ -10,8 +10,6 @@ use std::{path::PathBuf, sync::Arc};
 
 #[derive(Default)]
 pub struct Config {
-    /// Единственный владелец: только этот Telegram-ID может настраивать объект и утверждать счета.
-    pub landlord_telegram_id: i64,
     pub bot_username: String,
     /// Куда сохранять оригиналы фото (`None` — только ссылки Telegram).
     pub photo_dir: Option<PathBuf>,
@@ -121,10 +119,30 @@ pub fn user_err<T>(msg: impl Into<String>) -> Res<T> {
     Err(AppError::User(msg.into()))
 }
 
+/// Роль пользователя в конкретном объекте (строка `membership`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MRole {
+    Owner,
+    Tenant,
+}
+
+impl MRole {
+    fn parse(s: &str) -> Self {
+        if s == "owner" {
+            MRole::Owner
+        } else {
+            MRole::Tenant
+        }
+    }
+}
+
+/// Пользователь в контексте объекта: `property_id` — тот объект, в котором он сейчас действует
+/// (активный в боте или явно выбранный в Mini App). Права всегда проверяются по membership этого объекта.
 #[derive(Debug, Clone)]
 pub struct UserRow {
     pub id: i64,
     pub chat_id: i64,
+    pub property_id: Option<i64>,
 }
 
 pub enum Who {
@@ -220,58 +238,144 @@ impl App {
 
     /// Нужно ли скачивать фото от этого пользователя (чужим людям трафик не тратим).
     pub async fn accepts_photos_from(&self, telegram_id: i64) -> bool {
-        telegram_id == self.cfg.landlord_telegram_id
-            || sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM app_user WHERE telegram_id = ? AND role = 'tenant'",
-            )
-            .bind(telegram_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0)
-                > 0
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM membership m JOIN app_user u ON u.id = m.user_id
+              WHERE u.telegram_id = ? AND m.role = 'tenant'",
+        )
+        .bind(telegram_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0
     }
 
-    pub(crate) async fn who(&self, from: &Sender, now: NaiveDateTime) -> Res<Who> {
-        if from.telegram_id == self.cfg.landlord_telegram_id {
-            sqlx::query(
-                "INSERT INTO app_user (telegram_id, chat_id, role, display_name, created_at)
-                 VALUES (?, ?, 'landlord', ?, ?)
-                 ON CONFLICT(telegram_id) DO UPDATE SET chat_id = excluded.chat_id",
-            )
-            .bind(from.telegram_id)
-            .bind(from.chat_id)
-            .bind(&from.name)
-            .bind(now_iso(now))
-            .execute(&self.pool)
-            .await?;
-            let id: i64 = sqlx::query_scalar("SELECT id FROM app_user WHERE telegram_id = ?")
-                .bind(from.telegram_id)
-                .fetch_one(&self.pool)
-                .await?;
-            return Ok(Who::Landlord(UserRow {
-                id,
-                chat_id: from.chat_id,
-            }));
-        }
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM app_user WHERE telegram_id = ? AND role = 'tenant'")
-                .bind(from.telegram_id)
+    /// Все объекты пользователя: сначала где он владелец, затем по возрастанию id.
+    pub async fn memberships(&self, user_id: i64) -> Res<Vec<(i64, MRole)>> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT property_id, role FROM membership WHERE user_id = ? ORDER BY (role = 'owner') DESC, property_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, r)| (p, MRole::parse(&r)))
+            .collect())
+    }
+
+    /// Роль пользователя в объекте; `None` — не участник (даже если объект существует).
+    pub async fn role_in(&self, user_id: i64, property_id: i64) -> Res<Option<MRole>> {
+        let r: Option<String> =
+            sqlx::query_scalar("SELECT role FROM membership WHERE user_id = ? AND property_id = ?")
+                .bind(user_id)
+                .bind(property_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        match row {
-            Some((id,)) => {
-                sqlx::query("UPDATE app_user SET chat_id = ? WHERE id = ?")
-                    .bind(from.chat_id)
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-                Ok(Who::Tenant(UserRow {
-                    id,
-                    chat_id: from.chat_id,
-                }))
-            }
-            None => Ok(Who::Stranger),
+        Ok(r.as_deref().map(MRole::parse))
+    }
+
+    /// Активный объект: выбранный пользователем (если он в нём участник), иначе первый из его объектов.
+    pub(crate) async fn resolve_active(
+        &self,
+        user_id: i64,
+        active: Option<i64>,
+    ) -> Res<Option<(i64, MRole)>> {
+        let list = self.memberships(user_id).await?;
+        Ok(active
+            .and_then(|a| list.iter().find(|m| m.0 == a).copied())
+            .or_else(|| list.first().copied()))
+    }
+
+    /// Переключает активный объект. Чужой объект выбрать нельзя.
+    pub async fn set_active_property(&self, user_id: i64, property_id: i64) -> Res<()> {
+        if self.role_in(user_id, property_id).await?.is_none() {
+            return user_err("Это не ваш объект.");
         }
+        sqlx::query("UPDATE app_user SET active_property_id = ? WHERE id = ?")
+            .bind(property_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Регистрирует Telegram-пользователя как собственника (self-service). Повторный вызов безопасен.
+    pub async fn register_owner(&self, from: &Sender, now: NaiveDateTime) -> Res<i64> {
+        sqlx::query(
+            "INSERT INTO app_user (telegram_id, chat_id, role, display_name, created_at) VALUES (?, ?, 'landlord', ?, ?)
+             ON CONFLICT(telegram_id) DO UPDATE SET chat_id = excluded.chat_id, role = 'landlord'",
+        )
+        .bind(from.telegram_id)
+        .bind(from.chat_id)
+        .bind(&from.name)
+        .bind(now_iso(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(
+            sqlx::query_scalar("SELECT id FROM app_user WHERE telegram_id = ?")
+                .bind(from.telegram_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Объект, которым владелец управляет командами бота: активный, если он в нём владелец, иначе первый его объект.
+    pub(crate) async fn owner_property(&self, telegram_id: i64) -> Res<Option<i64>> {
+        let row: Option<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, active_property_id FROM app_user WHERE telegram_id = ?")
+                .bind(telegram_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((uid, active)) = row else {
+            return Ok(None);
+        };
+        let owned: Vec<i64> = self
+            .memberships(uid)
+            .await?
+            .into_iter()
+            .filter(|m| m.1 == MRole::Owner)
+            .map(|m| m.0)
+            .collect();
+        Ok(active
+            .filter(|a| owned.contains(a))
+            .or_else(|| owned.first().copied()))
+    }
+
+    /// Объект арендатора из контекста пользователя. Для владельца этой функции быть не должно.
+    pub(crate) fn tenant_property(&self, u: &UserRow) -> Res<i64> {
+        match u.property_id {
+            Some(p) => Ok(p),
+            None => user_err("Вы не подключены ни к одному объекту."),
+        }
+    }
+
+    pub(crate) async fn who(&self, from: &Sender, _now: NaiveDateTime) -> Res<Who> {
+        let row: Option<(i64, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, active_property_id, role FROM app_user WHERE telegram_id = ?",
+        )
+        .bind(from.telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, active, legacy_role)) = row else {
+            return Ok(Who::Stranger);
+        };
+        sqlx::query("UPDATE app_user SET chat_id = ? WHERE id = ?")
+            .bind(from.chat_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let mk = |property_id| UserRow {
+            id,
+            chat_id: from.chat_id,
+            property_id,
+        };
+        Ok(match self.resolve_active(id, active).await? {
+            Some((p, MRole::Owner)) => Who::Landlord(mk(Some(p))),
+            Some((p, MRole::Tenant)) => Who::Tenant(mk(Some(p))),
+            // зарегистрирован как собственник, но объектов ещё нет (мастер не завершён)
+            None if legacy_role == "landlord" => Who::Landlord(mk(None)),
+            None => Who::Stranger,
+        })
     }
 
     pub(crate) async fn state(&self, telegram_id: i64) -> Res<Option<State>> {
@@ -301,10 +405,32 @@ impl App {
     }
 
     async fn route(&self, from: &Sender, input: Incoming, now: NaiveDateTime) -> Res<Vec<Reply>> {
-        let who = self.who(from, now).await?;
+        let mut who = self.who(from, now).await?;
+        // Self-service: незнакомый пользователь становится собственником, только если сам об этом просит
+        // (/setup или кнопка «Я сдаю квартиру»). Приглашение арендатора (/start <токен>) обрабатывается ниже.
+        if matches!(who, Who::Stranger) {
+            let wants_owner = match &input {
+                Incoming::Text(t) => {
+                    t.split_whitespace()
+                        .next()
+                        .map(|c| c.split('@').next().unwrap_or(c))
+                        == Some("/setup")
+                }
+                Incoming::Callback(d) => d == "reg_owner",
+                _ => false,
+            };
+            if wants_owner {
+                self.register_owner(from, now).await?;
+                who = self.who(from, now).await?;
+            }
+        }
         match input {
             Incoming::Start(Some(token)) => self.accept_invite(from, &who, &token, now).await,
             Incoming::Start(None) => Ok(vec![self.help(from, &who)]),
+            Incoming::Callback(data) if data == "reg_owner" => match &who {
+                Who::Landlord(u) => self.setup_start(from, u).await,
+                _ => user_err("Вы уже зарегистрированы."),
+            },
             Incoming::Callback(data) => self.callback(from, &who, &data, now).await,
             Incoming::Photo {
                 file_id,
@@ -325,12 +451,16 @@ impl App {
     }
 
     fn stranger(&self, from: &Sender) -> Reply {
-        Reply::text(
+        Reply::with_buttons(
             from.chat_id,
             format!(
-                "Вы не подключены. Откройте ссылку-приглашение, которую прислал владелец квартиры.\nВаш Telegram-ID: {}",
+                "Здравствуйте! RentFlow считает коммунальные платежи между владельцем и арендатором.\n\n\
+                 • Сдаёте квартиру — нажмите кнопку ниже или /setup.\n\
+                 • Вы арендатор — откройте ссылку-приглашение, которую прислал владелец.\n\n\
+                 Ваш Telegram-ID: {}",
                 from.telegram_id
             ),
+            vec![vec![("🏠 Я сдаю квартиру", "reg_owner".into())]],
         )
     }
 
@@ -346,6 +476,7 @@ impl App {
                 /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
+                /objects — мои квартиры и переключение между ними\n\
                 /schedule — день передачи показаний и напоминания (/schedule 25, /schedule off)\n\
                 /void — аннулировать утверждённый или оплаченный счёт (с причиной и подтверждением)\n\
                 /calc — пересчитать период, когда все показания уже приняты\n\
@@ -398,6 +529,7 @@ impl App {
                 "/reissue" => self.reissue_list(from).await,
                 "/void" => self.void_list(from).await,
                 "/schedule" => self.schedule_cmd(from, text).await,
+                "/objects" => self.objects_list(from, u).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),
@@ -406,6 +538,7 @@ impl App {
             Who::Tenant(u) => match cmd {
                 "/enter" => self.entry_start(from, u, now).await,
                 "/readings" => self.tenant_readings(from, u, now).await,
+                "/objects" => self.objects_list(from, u).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),
                 _ => self.tenant_text(from, u, text, now).await,
             },
@@ -443,6 +576,9 @@ impl App {
             (Who::Landlord(_), "vo") => self.void_pick(from, id.unwrap_or(0)).await,
             (Who::Landlord(_), "vc") => self.void_confirm(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "vx") => self.void_cancel(from).await,
+            (Who::Landlord(u) | Who::Tenant(u), "sw") => {
+                self.objects_switch(from, u, id.unwrap_or(0)).await
+            }
             (Who::Landlord(_), "rx") => {
                 Ok(vec![Reply::text(from.chat_id, "Оставлено без изменений.")])
             }

@@ -116,12 +116,6 @@ impl App {
         // Тарифы заводятся на текущий расчётный месяц независимо от даты настройки.
         let month = period_of(now.date());
         let mut tx = self.pool.begin().await?;
-        let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM property")
-            .fetch_one(&mut *tx)
-            .await?;
-        if exists > 0 {
-            return user_err("Объект уже настроен.");
-        }
         let property_id =
             sqlx::query("INSERT INTO property (landlord_id, name, created_at) VALUES (?, ?, ?)")
                 .bind(landlord_id)
@@ -133,6 +127,17 @@ impl App {
         sqlx::query("INSERT INTO tenancy (property_id, tenant_name) VALUES (?, ?)")
             .bind(property_id)
             .bind(&np.tenant_name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO membership (user_id, property_id, role, created_at) VALUES (?, ?, 'owner', ?)")
+            .bind(landlord_id)
+            .bind(property_id)
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE app_user SET active_property_id = ? WHERE id = ?")
+            .bind(property_id)
+            .bind(landlord_id)
             .execute(&mut *tx)
             .await?;
         let find = |list: &[(String, String)], code: &str| {
@@ -213,20 +218,7 @@ impl App {
 }
 
 impl App {
-    pub(crate) async fn property_id(&self) -> Res<Option<i64>> {
-        Ok(
-            sqlx::query_scalar("SELECT id FROM property ORDER BY id LIMIT 1")
-                .fetch_optional(&self.pool)
-                .await?,
-        )
-    }
-
     pub(crate) async fn setup_start(&self, from: &Sender, _u: &UserRow) -> Res<Vec<Reply>> {
-        if self.property_id().await?.is_some() {
-            return user_err(
-                "Объект уже настроен (в этой версии один объект). Тарифы добавляются командой /tariff, арендатор — /invite.",
-            );
-        }
         self.set_state(
             from.telegram_id,
             &State::Setup {
@@ -360,7 +352,7 @@ impl App {
         u: &UserRow,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         let _ = u;
@@ -382,37 +374,73 @@ impl App {
         token: &str,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        match who {
-            Who::Landlord(_) => {
-                return user_err("Вы владелец. Ссылку-приглашение открывает арендатор.");
-            }
-            Who::Tenant(_) => {
-                return user_err("Вы уже подключены. Отправьте фото счётчиков или нажмите /enter.");
-            }
-            Who::Stranger => {}
-        }
         let ts = now_iso(now);
         let mut tx = self.pool.begin().await?;
-        let invite: Option<(i64,)> = sqlx::query_as(
-            "SELECT property_id FROM invite WHERE token = ? AND used_at IS NULL AND expires_at > ?",
+        let invite: Option<(i64, Option<i64>, String, Option<String>)> = sqlx::query_as(
+            "SELECT property_id, used_by, expires_at, used_at FROM invite WHERE token = ?",
         )
         .bind(token)
-        .bind(&ts)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((property_id,)) = invite else {
+        let Some((property_id, used_by, expires_at, used_at)) = invite else {
+            return user_err("Ссылка недействительна. Попросите владельца прислать новую.");
+        };
+        // Пользователь: существующий (в любой роли — арендатор может быть владельцем другой квартиры) или новый.
+        let existing: Option<i64> = match who {
+            Who::Landlord(u) | Who::Tenant(u) => Some(u.id),
+            Who::Stranger => None,
+        };
+        // Повтор того же приглашения тем же человеком (повторное нажатие / доставка) безопасен.
+        if let (Some(uid), Some(used)) = (existing, used_by)
+            && uid == used
+        {
+            drop(tx);
+            self.set_active_property(uid, property_id).await?;
+            return user_err("Вы уже подключены к этому объекту: /enter — ввести показания.");
+        }
+        if used_at.is_some() || expires_at <= ts {
             return user_err(
                 "Ссылка недействительна: она уже использована или истекла. Попросите владельца прислать новую.",
             );
+        }
+        if let Some(uid) = existing {
+            let role: Option<String> = sqlx::query_scalar(
+                "SELECT role FROM membership WHERE user_id = ? AND property_id = ?",
+            )
+            .bind(uid)
+            .bind(property_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match role.as_deref() {
+                Some("owner") => {
+                    return user_err(
+                        "Вы владелец этого объекта. Ссылку-приглашение открывает арендатор.",
+                    );
+                }
+                Some(_) => return user_err("Вы уже подключены к этому объекту."),
+                None => {}
+            }
+        }
+        let user_id = match existing {
+            Some(uid) => {
+                sqlx::query("UPDATE app_user SET chat_id = ? WHERE id = ?")
+                    .bind(from.chat_id)
+                    .bind(uid)
+                    .execute(&mut *tx)
+                    .await?;
+                uid
+            }
+            None => {
+                sqlx::query("INSERT INTO app_user (telegram_id, chat_id, role, display_name, created_at) VALUES (?, ?, 'tenant', ?, ?)")
+                    .bind(from.telegram_id)
+                    .bind(from.chat_id)
+                    .bind(&from.name)
+                    .bind(&ts)
+                    .execute(&mut *tx)
+                    .await?
+                    .last_insert_rowid()
+            }
         };
-        let user_id = sqlx::query("INSERT INTO app_user (telegram_id, chat_id, role, display_name, created_at) VALUES (?, ?, 'tenant', ?, ?)")
-            .bind(from.telegram_id)
-            .bind(from.chat_id)
-            .bind(&from.name)
-            .bind(&ts)
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
         // Одноразовость: токен гасится атомарно, второй параллельный запрос получит 0 строк.
         let used = sqlx::query(
             "UPDATE invite SET used_by = ?, used_at = ? WHERE token = ? AND used_at IS NULL",
@@ -430,6 +458,17 @@ impl App {
         if used.rows_affected() != 1 || linked.rows_affected() != 1 {
             return user_err("Ссылка недействительна или арендатор уже подключён.");
         }
+        sqlx::query("INSERT INTO membership (user_id, property_id, role, created_at) VALUES (?, ?, 'tenant', ?)")
+            .bind(user_id)
+            .bind(property_id)
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE app_user SET active_property_id = ? WHERE id = ?")
+            .bind(property_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         let (name, landlord_chat): (String, i64) = sqlx::query_as(
             "SELECT p.name, l.chat_id FROM property p JOIN app_user l ON l.id = p.landlord_id WHERE p.id = ?",
         )
@@ -521,4 +560,61 @@ pub(crate) async fn insert_tariff(
     .execute(&mut *tx)
     .await?;
     Ok(())
+}
+
+impl App {
+    /// `/objects`: мои квартиры (в каких я владелец, в каких арендатор) и переключение активной.
+    pub(crate) async fn objects_list(&self, from: &Sender, u: &UserRow) -> Res<Vec<Reply>> {
+        let list = self.memberships(u.id).await?;
+        if list.is_empty() {
+            return user_err(
+                "У вас пока нет объектов. Владелец — /setup, арендатор — ссылка-приглашение.",
+            );
+        }
+        let mut buttons = vec![];
+        for (pid, role) in list {
+            let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
+                .bind(pid)
+                .fetch_one(&self.pool)
+                .await?;
+            let mark = if u.property_id == Some(pid) {
+                "✅ "
+            } else {
+                ""
+            };
+            let who = if role == MRole::Owner {
+                "владелец"
+            } else {
+                "арендатор"
+            };
+            buttons.push(vec![Button {
+                label: format!("{mark}{name} — {who}"),
+                data: format!("sw:{pid}"),
+            }]);
+        }
+        Ok(vec![Reply {
+            chat_id: from.chat_id,
+            text: "Ваши объекты. Нажмите, чтобы переключиться (команды бота работают с выбранным объектом):".into(),
+            buttons,
+            photos: vec![],
+        }])
+    }
+
+    /// Переключение объекта: только в свой (membership проверяется).
+    pub(crate) async fn objects_switch(
+        &self,
+        from: &Sender,
+        u: &UserRow,
+        property_id: i64,
+    ) -> Res<Vec<Reply>> {
+        self.set_active_property(u.id, property_id).await?;
+        let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(vec![Reply::text(
+            from.chat_id,
+            format!("Активный объект: «{name}»."),
+        )])
+    }
 }

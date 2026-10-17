@@ -56,7 +56,7 @@ impl App {
 
     /// `/schedule` — показать, `/schedule 25` — задать, `/schedule off` — снять.
     pub(crate) async fn schedule_cmd(&self, from: &Sender, text: &str) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         let arg = text.split_whitespace().nth(1);

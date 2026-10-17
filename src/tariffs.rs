@@ -57,7 +57,7 @@ impl App {
         from: &Sender,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен. Начните с /setup");
         };
         let current = period_of(now.date());
@@ -150,7 +150,7 @@ impl App {
                 "Не получилось разобрать месяц. Введите его как ГГГГ-ММ, например 2026-11.",
             );
         };
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         self.set_state(
@@ -251,7 +251,7 @@ impl App {
         if answer == "off" && code != "sewer" {
             return user_err("Выключить можно только водоотведение.");
         }
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         // Цена, равная действующей в этом месяце, — не изменение: новая версия не создаётся.
@@ -347,7 +347,7 @@ impl App {
         if step != TOTAL || answers.len() != TOTAL {
             return user_err("Не все позиции заполнены — продолжайте по шагам.");
         }
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         let changes: Vec<(&str, Change)> = CODES
@@ -378,7 +378,7 @@ impl App {
         text: &str,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Сначала настройте объект: /setup");
         };
         let args: Vec<&str> = text.split_whitespace().skip(1).collect();
@@ -518,13 +518,11 @@ impl App {
     pub async fn change_tariffs(
         &self,
         chat: i64,
+        property_id: i64,
         month: &str,
         changes: &[(&str, Change)],
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
-            return user_err("Объект не настроен.");
-        };
         let mut effective = vec![];
         for (code, change) in changes {
             let current = self.tariff_at(property_id, code, month).await?;

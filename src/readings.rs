@@ -89,19 +89,6 @@ pub struct FormView {
 const TOTAL: usize = REGISTERS.len();
 
 impl App {
-    /// Объект арендатора. Все дальнейшие обращения к данным идут через него: чужой объект недостижим.
-    pub(crate) async fn tenancy_of(&self, user_id: i64) -> Res<i64> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT property_id FROM tenancy WHERE tenant_user_id = ?")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((p,)) => Ok(p),
-            None => user_err("Вы не подключены ни к одному объекту."),
-        }
-    }
-
     pub(crate) async fn landlord_chat(&self, property_id: i64) -> Res<i64> {
         Ok(sqlx::query_scalar("SELECT l.chat_id FROM property p JOIN app_user l ON l.id = p.landlord_id WHERE p.id = ?")
             .bind(property_id)
@@ -184,7 +171,7 @@ impl App {
         u: &UserRow,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         let got = self.received(property_id, &period).await?;
         let drafts = self.load_drafts(u.id, &period).await?;
@@ -206,7 +193,7 @@ impl App {
         from: &Sender,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен. Начните с /setup");
         };
         let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
@@ -270,7 +257,7 @@ impl App {
 
     /// Владелец сбрасывает неполный период (например, арендатор ошибся в нескольких значениях).
     pub(crate) async fn reset_period(&self, from: &Sender, now: NaiveDateTime) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен.");
         };
         let period = self.open_period(property_id, now).await?;
@@ -575,8 +562,9 @@ impl App {
     }
 
     /// Состояние формы ввода показаний арендатора: период, по каждому регистру — прошлое, введённое, фото, подсказка ИИ.
-    pub async fn form_view(&self, user_id: i64, now: NaiveDateTime) -> Res<FormView> {
-        let property_id = self.tenancy_of(user_id).await?;
+    pub async fn form_view(&self, u: &UserRow, now: NaiveDateTime) -> Res<FormView> {
+        let user_id = u.id;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         let billed = self.period_billed(property_id, &period).await?;
         let mut registers = vec![];
@@ -614,7 +602,7 @@ impl App {
     /// Значение регистра, введённое или исправленное вручную (проверка «не меньше прошлого» — здесь же).
     pub async fn form_set_value(
         &self,
-        user_id: i64,
+        u: &UserRow,
         code: &str,
         raw: &str,
         now: NaiveDateTime,
@@ -622,7 +610,8 @@ impl App {
         if !is_register(code) {
             return user_err("Неизвестный счётчик.");
         }
-        let property_id = self.tenancy_of(user_id).await?;
+        let user_id = u.id;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -643,7 +632,7 @@ impl App {
     /// человек подтверждает или исправляет. Недоступный ИИ не мешает: фото остаётся, число вводится вручную.
     pub async fn form_photo(
         &self,
-        user_id: i64,
+        u: &UserRow,
         code: &str,
         bytes: &[u8],
         now: NaiveDateTime,
@@ -654,7 +643,8 @@ impl App {
         if bytes.is_empty() {
             return user_err("Пустой файл.");
         }
-        let property_id = self.tenancy_of(user_id).await?;
+        let user_id = u.id;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -741,11 +731,12 @@ impl App {
     /// Путь к фото регистра в открытой форме этого арендатора.
     pub async fn form_photo_path(
         &self,
-        user_id: i64,
+        u: &UserRow,
         code: &str,
         now: NaiveDateTime,
     ) -> Res<Option<String>> {
-        let property_id = self.tenancy_of(user_id).await?;
+        let user_id = u.id;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         Ok(self
             .existing_row(user_id, &period, code)
@@ -905,7 +896,7 @@ impl App {
 
     /// `/proof`: сделать фото-подтверждение обязательным или необязательным.
     pub(crate) async fn proof_cmd(&self, from: &Sender) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен. Начните с /setup");
         };
         let on = self.proof_required(property_id).await?;
@@ -927,7 +918,7 @@ impl App {
     }
 
     pub(crate) async fn proof_set(&self, from: &Sender, mode: &str) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен. Начните с /setup");
         };
         let on = match mode {
@@ -956,7 +947,7 @@ impl App {
         u: &UserRow,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -983,7 +974,7 @@ impl App {
         if !is_register(code) {
             return user_err("Неизвестный счётчик.");
         }
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         self.set_state(
             from.telegram_id,
@@ -1004,7 +995,7 @@ impl App {
         u: &UserRow,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         sqlx::query("UPDATE pending_reading SET status = 'discarded' WHERE user_id = ? AND period = ? AND status = 'open'")
             .bind(u.id)
@@ -1037,7 +1028,7 @@ impl App {
                 )]);
             }
         };
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             self.clear_state(from.telegram_id).await?;
@@ -1088,7 +1079,7 @@ impl App {
         bytes: &[u8],
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return user_err(format!(
@@ -1351,7 +1342,7 @@ impl App {
         u: &UserRow,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let property_id = self.tenancy_of(u.id).await?;
+        let property_id = self.tenant_property(u)?;
         let period = self.open_period(property_id, now).await?;
         if self.period_billed(property_id, &period).await? {
             return Ok(vec![Reply::text(
@@ -1477,7 +1468,7 @@ impl App {
 
     /// Владелец повторно запускает расчёт открытого периода, когда все показания уже приняты.
     pub(crate) async fn calc_cmd(&self, from: &Sender, now: NaiveDateTime) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
+        let Some(property_id) = self.owner_property(from.telegram_id).await? else {
             return user_err("Объект не настроен.");
         };
         let period = self.open_period(property_id, now).await?;

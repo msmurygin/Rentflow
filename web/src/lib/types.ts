@@ -1,4 +1,4 @@
-export type Role = 'landlord' | 'tenant';
+export type Role = 'landlord' | 'tenant' | 'new';
 export type BillStatus = 'draft' | 'approved' | 'paid' | 'rejected' | 'void';
 
 export interface Me {

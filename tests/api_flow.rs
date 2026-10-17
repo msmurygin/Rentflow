@@ -71,7 +71,6 @@ impl Api {
         let app = Arc::new(App::new(
             pool,
             Config {
-                landlord_telegram_id: LANDLORD,
                 bot_username: "rentflow_bot".into(),
                 photo_dir: Some(photos),
                 invite_ttl_days: 7,
@@ -156,6 +155,16 @@ impl Api {
             .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         v["token"].as_str().unwrap().to_string()
+    }
+
+    /// Самостоятельная регистрация собственника: вход через Telegram + POST /api/register.
+    async fn login_owner(&self, user_id: i64) -> String {
+        let t = self.login(user_id).await;
+        let (s, v) = self
+            .call(Method::POST, "/api/register", Some(&t), Some(json!({})))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        t
     }
 
     async fn setup_property(&self, landlord: &str) {
@@ -269,18 +278,25 @@ async fn forged_expired_and_missing_credentials_get_401() {
         )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    // верная подпись, но человек не подключён ни к какому объекту
-    let (s, _) = api
-        .call(
-            Method::POST,
-            "/api/auth/telegram",
-            None,
-            Some(json!({ "init_data": api.init_data(STRANGER, api.now_unix) })),
-        )
+    // верная подпись, но человек нигде не зарегистрирован: сессия есть, роль «new», данных нет
+    let stranger = api.login(STRANGER).await;
+    let (s, v) = api
+        .call(Method::GET, "/api/me", Some(&stranger), None)
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!((s, v["role"].as_str()), (StatusCode::OK, Some("new")));
+    for path in [
+        "/api/home",
+        "/api/property",
+        "/api/bills",
+        "/api/tariffs",
+        "/api/meters",
+        "/api/readings/draft",
+    ] {
+        let (s, _) = api.call(Method::GET, path, Some(&stranger), None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{path}");
+    }
     // корректный вход работает
-    let t = api.login(LANDLORD).await;
+    let t = api.login_owner(LANDLORD).await;
     let (s, v) = api.call(Method::GET, "/api/me", Some(&t), None).await;
     assert_eq!((s, v["role"].as_str()), (StatusCode::OK, Some("landlord")));
 }
@@ -288,7 +304,7 @@ async fn forged_expired_and_missing_credentials_get_401() {
 #[tokio::test]
 async fn tenant_cannot_do_landlord_things() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     let tenant = api.connect_tenant(&landlord).await;
     let (s, v) = api.call(Method::GET, "/api/me", Some(&tenant), None).await;
@@ -303,10 +319,6 @@ async fn tenant_cannot_do_landlord_things() {
         (Method::GET, "/api/tariffs", None),
         (Method::PUT, "/api/property", Some(json!({ "name": "Моя" }))),
         (Method::POST, "/api/invitations", Some(json!({}))),
-        (Method::POST, "/api/bills/1/approve", Some(json!({}))),
-        (Method::POST, "/api/bills/1/reject", Some(json!({}))),
-        (Method::POST, "/api/bills/1/paid", Some(json!({}))),
-        (Method::POST, "/api/bills/1/reissue", Some(json!({}))),
     ] {
         let (s, v) = api.call(m.clone(), p, Some(&tenant), b).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{m} {p}: {v}");
@@ -337,7 +349,7 @@ async fn tenant_cannot_do_landlord_things() {
 #[tokio::test]
 async fn property_is_created_once_without_any_bill() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     let (_, v) = api
         .call(Method::GET, "/api/property", Some(&landlord), None)
         .await;
@@ -388,7 +400,7 @@ async fn property_is_created_once_without_any_bill() {
 #[tokio::test]
 async fn full_month_over_http() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     let tenant = api.connect_tenant(&landlord).await;
 
@@ -579,7 +591,11 @@ async fn full_month_over_http() {
             Some(json!({})),
         )
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "неутверждённый счёт арендатору не виден вовсе"
+    );
 
     // детали счёта: формула, даты и фото
     let (_, d) = api
@@ -684,6 +700,18 @@ async fn full_month_over_http() {
         )
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "двойное утверждение");
+    // утверждённый счёт арендатор видит, но действовать над ним не может
+    for action in ["approve", "reject", "paid", "reissue", "void"] {
+        let (s, _) = api
+            .call(
+                Method::POST,
+                &format!("/api/bills/{new_draft}/{action}"),
+                Some(&tenant),
+                Some(json!({ "reason": "x" })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "арендатор: {action}");
+    }
     let (_, v) = api
         .call(Method::GET, "/api/bills", Some(&tenant), None)
         .await;
@@ -747,7 +775,7 @@ async fn full_month_over_http() {
 #[tokio::test]
 async fn golden_totals_come_out_of_the_api_too() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     sqlx::query("UPDATE property SET proof_required = 0")
         .execute(api.app.pool())
@@ -788,7 +816,7 @@ async fn golden_totals_come_out_of_the_api_too() {
 #[tokio::test]
 async fn session_dies_when_access_is_revoked() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     let tenant = api.connect_tenant(&landlord).await;
     sqlx::query("DELETE FROM api_session WHERE telegram_id = ?")
@@ -841,7 +869,7 @@ async fn static_frontend_and_health_are_served_without_auth() {
 #[tokio::test]
 async fn schedule_and_void_work_through_the_api() {
     let api = Api::new().await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     let tenant = api.connect_tenant(&landlord).await;
     sqlx::query("UPDATE property SET proof_required = 0")
@@ -1025,7 +1053,7 @@ async fn schedule_and_void_work_through_the_api() {
 #[tokio::test]
 async fn paid_void_is_refused_over_http_unless_the_test_flag_is_on() {
     let api = Api::build(false).await;
-    let landlord = api.login(LANDLORD).await;
+    let landlord = api.login_owner(LANDLORD).await;
     api.setup_property(&landlord).await;
     sqlx::query("UPDATE property SET proof_required = 0")
         .execute(api.app.pool())

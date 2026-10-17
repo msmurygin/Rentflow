@@ -53,11 +53,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(App::new(
         pool,
         Config {
-            landlord_telegram_id: 1,
             bot_username: "rentflow_dev_bot".into(),
             photo_dir: Some(dir.join("photos")),
             invite_ttl_days: 7,
             ocr_enabled: true,
+            // только на учебном стенде: сценарий проверяет и аннулирование оплаченного счёта
+            allow_void_paid: true,
             ..Default::default()
         },
         Arc::new(DemoOcr),

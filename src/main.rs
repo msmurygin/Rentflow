@@ -107,10 +107,11 @@ async fn main() -> Result<()> {
 
     let token =
         env("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN не задан (токен от @BotFather)")?;
-    let landlord_telegram_id: i64 = env("LANDLORD_TELEGRAM_ID")
-        .context("LANDLORD_TELEGRAM_ID не задан (ваш числовой Telegram-ID; узнать: напишите боту /whoami)")?
-        .parse()
-        .context("LANDLORD_TELEGRAM_ID должен быть числом")?;
+    // LANDLORD_TELEGRAM_ID больше не даёт прав: владельцы регистрируются сами, права берутся из membership.
+    // Старое значение используется только как получатель алертов, если ADMIN_TELEGRAM_ID не задан.
+    let legacy_admin: Option<i64> = env("LANDLORD_TELEGRAM_ID")
+        .and_then(|v| v.parse().ok())
+        .filter(|id| *id != 0);
     let database_url = env("DATABASE_URL").unwrap_or_else(|| "sqlite://data/rentflow.db".into());
     if let Some(path) = database_url
         .strip_prefix("sqlite://")
@@ -154,7 +155,6 @@ async fn main() -> Result<()> {
     let app = Arc::new(App::new(
         pool,
         Config {
-            landlord_telegram_id,
             bot_username,
             photo_dir: Some(PathBuf::from(
                 env("PHOTO_DIR").unwrap_or_else(|| "data/photos".into()),
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
             allow_void_paid: env("ALLOW_VOID_PAID").is_some_and(|v| v == "1"),
             admin_telegram_id: env("ADMIN_TELEGRAM_ID")
                 .and_then(|v| v.parse().ok())
-                .or(Some(landlord_telegram_id).filter(|id| *id != 0)),
+                .or(legacy_admin),
             data_dir: database_url
                 .strip_prefix("sqlite://")
                 .and_then(|p| std::path::Path::new(p).parent())

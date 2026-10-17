@@ -3,7 +3,7 @@
 
 pub mod auth;
 
-use crate::app::{App, AppError, Reply, Sender, UserRow, Who, now_iso};
+use crate::app::{App, AppError, MRole, Reply, Sender, UserRow, Who, now_iso};
 use crate::bills::{TariffRow, effective_tariff};
 use crate::setup::NewProperty;
 use crate::tariffs::{CODES, Change};
@@ -167,36 +167,78 @@ fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Действительная сессия Telegram-пользователя (ещё без ролей): нужна и тем, кто не зарегистрирован.
+async fn session_sender(parts: &Parts, st: &ApiState) -> Result<Sender, ApiError> {
+    let token = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT telegram_id, name FROM api_session WHERE token_hash = ? AND expires_at > ?",
+    )
+    .bind(token_hash(token))
+    .bind(now_iso(st.now()))
+    .fetch_optional(st.app.pool())
+    .await?;
+    let (telegram_id, name) = row.ok_or(ApiError::Unauthorized)?;
+    // В личном чате chat_id совпадает с id пользователя.
+    Ok(Sender {
+        telegram_id,
+        chat_id: telegram_id,
+        name,
+    })
+}
+
+/// Только сессия, без требования участия в объекте (`/me`, `/register`).
+pub struct AnySession(pub Sender);
+
+impl FromRequestParts<Arc<ApiState>> for AnySession {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, st: &Arc<ApiState>) -> Result<Self, ApiError> {
+        Ok(AnySession(session_sender(parts, st).await?))
+    }
+}
+
 impl FromRequestParts<Arc<ApiState>> for Ctx {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, st: &Arc<ApiState>) -> Result<Self, ApiError> {
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(ApiError::Unauthorized)?;
         let now = st.now();
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT telegram_id, name FROM api_session WHERE token_hash = ? AND expires_at > ?",
-        )
-        .bind(token_hash(token))
-        .bind(now_iso(now))
-        .fetch_optional(st.app.pool())
-        .await?;
-        let (telegram_id, name) = row.ok_or(ApiError::Unauthorized)?;
-        // В личном чате chat_id совпадает с id пользователя.
-        let sender = Sender {
-            telegram_id,
-            chat_id: telegram_id,
-            name,
-        };
+        let sender = session_sender(parts, st).await?;
         // Роль определяется заново на каждый запрос: отозванный доступ действует сразу.
-        let role = match st.app.who(&sender, now).await? {
-            Who::Landlord(u) => Role::Landlord(u),
-            Who::Tenant(u) => Role::Tenant(u),
-            Who::Stranger => return Err(ApiError::Forbidden("Вы не подключены к объекту.")),
+        let mut user = match st.app.who(&sender, now).await? {
+            Who::Landlord(u) | Who::Tenant(u) => u,
+            Who::Stranger => {
+                return Err(ApiError::Forbidden(
+                    "Вы ещё не зарегистрированы: выберите роль.",
+                ));
+            }
+        };
+        // Явно выбранный объект (заголовок X-Property-Id): доступ только участникам; чужой и несуществующий
+        // неотличимы (404), чтобы не раскрывать, что такой объект есть.
+        let role = match parts.headers.get("x-property-id") {
+            Some(h) => {
+                let pid: i64 = h
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or(ApiError::NotFound)?;
+                user.property_id = Some(pid);
+                st.app
+                    .role_in(user.id, pid)
+                    .await?
+                    .ok_or(ApiError::NotFound)?
+            }
+            None => match user.property_id {
+                Some(pid) => st.app.role_in(user.id, pid).await?.unwrap_or(MRole::Owner),
+                None => MRole::Owner, // собственник без объектов (мастер не завершён)
+            },
+        };
+        let role = match role {
+            MRole::Owner => Role::Landlord(user),
+            MRole::Tenant => Role::Tenant(user),
         };
         Ok(Ctx { sender, role })
     }
@@ -208,8 +250,7 @@ impl ApiState {
     /// Объект текущего пользователя: у арендатора — назначенный, у владельца — его объект.
     async fn property_of(&self, ctx: &Ctx) -> Result<Option<i64>, ApiError> {
         Ok(match &ctx.role {
-            Role::Landlord(_) => self.app.property_id().await?,
-            Role::Tenant(u) => Some(self.app.tenancy_of(u.id).await?),
+            Role::Landlord(u) | Role::Tenant(u) => u.property_id,
         })
     }
 
@@ -278,11 +319,7 @@ async fn auth_telegram(State(st): St, Json(body): Json<AuthBody>) -> ApiResult {
     let role = match st.app.who(&sender, now).await? {
         Who::Landlord(_) => "landlord",
         Who::Tenant(_) => "tenant",
-        Who::Stranger => {
-            return Err(ApiError::Forbidden(
-                "Вы не подключены. Откройте ссылку-приглашение от владельца квартиры.",
-            ));
-        }
+        Who::Stranger => "new",
     };
     let token = format!(
         "{}{}",
@@ -306,13 +343,46 @@ async fn auth_telegram(State(st): St, Json(body): Json<AuthBody>) -> ApiResult {
     ))
 }
 
-async fn me(State(st): St, ctx: Ctx) -> ApiResult {
+async fn me(State(st): St, AnySession(sender): AnySession) -> ApiResult {
+    let who = st.app.who(&sender, st.now()).await?;
+    let (role, user) = match &who {
+        Who::Landlord(u) => ("landlord", Some(u)),
+        Who::Tenant(u) => ("tenant", Some(u)),
+        Who::Stranger => ("new", None),
+    };
+    let mut properties = vec![];
+    if let Some(u) = user {
+        for (pid, r) in st.app.memberships(u.id).await? {
+            let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
+                .bind(pid)
+                .fetch_one(st.app.pool())
+                .await?;
+            properties.push(json!({ "id": pid, "name": name, "role": if r == MRole::Owner { "owner" } else { "tenant" }, "active": u.property_id == Some(pid) }));
+        }
+    }
     Ok(Json(json!({
-        "role": ctx.role_name(),
-        "name": ctx.sender.name,
+        "role": role,
+        "name": sender.name,
         "bot_username": st.app.cfg.bot_username,
-        "property_configured": st.app.property_id().await?.is_some(),
+        "property_configured": user.is_some_and(|u| u.property_id.is_some()),
+        "properties": properties,
     })))
+}
+
+/// Самостоятельная регистрация собственника. Повторный вызов безопасен. Арендатором становятся только по приглашению.
+async fn register(State(st): St, AnySession(sender): AnySession) -> ApiResult {
+    st.app.register_owner(&sender, st.now()).await?;
+    let ctx_audit = sqlx::query(
+        "INSERT INTO audit_log (at, actor, action, entity) VALUES (?, ?, 'owner_register', 'user')",
+    )
+    .bind(now_iso(st.now()))
+    .bind(sender.telegram_id)
+    .execute(st.app.pool())
+    .await;
+    if let Err(e) = ctx_audit {
+        tracing::error!(error = %e, "audit write failed");
+    }
+    Ok(Json(json!({ "role": "landlord" })))
 }
 
 // ---------- квартира ----------
@@ -419,65 +489,104 @@ fn decimals(
         .collect()
 }
 
-async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> ApiResult {
+/// Создание квартиры (первой или очередной) текущим пользователем как владельцем.
+async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<i64, ApiError> {
     let landlord = ctx.landlord()?;
     let now = st.now();
-    let id = match st.app.property_id().await? {
-        None => {
-            let Some(name) = clean_text(&b.name) else {
-                return bad("Укажите название квартиры.");
-            };
-            let Some(tenant_name) = clean_text(&b.tenant_name) else {
-                return bad("Укажите имя арендатора.");
-            };
-            let base_date = match b
-                .base_date
+    let id = {
+        let Some(name) = clean_text(&b.name) else {
+            return bad("Укажите название квартиры.");
+        };
+        let Some(tenant_name) = clean_text(&b.tenant_name) else {
+            return bad("Укажите имя арендатора.");
+        };
+        let base_date = match b
+            .base_date
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(d) => Some(
+                parse_date(d)
+                    .ok_or(ApiError::User("Дата показаний: ГГГГ-ММ-ДД.".into()))?
+                    .to_string(),
+            ),
+        };
+        let reg = ["cold", "hot", "t1", "t2"];
+        let np = NewProperty {
+            name,
+            tenant_name,
+            base_date,
+            baselines: decimals(&b.baselines, &reg, "Стартовые показания")?,
+            prices: decimals(&b.prices, &reg, "Тарифы")?,
+            sewer_price: match b
+                .sewer_price
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
                 None => None,
-                Some(d) => Some(
-                    parse_date(d)
-                        .ok_or(ApiError::User("Дата показаний: ГГГГ-ММ-ДД.".into()))?
+                Some(p) => Some(
+                    parse_decimal(p)
+                        .ok_or(ApiError::User("Тариф водоотведения: нужно число.".into()))?
                         .to_string(),
                 ),
-            };
-            let reg = ["cold", "hot", "t1", "t2"];
-            let np = NewProperty {
-                name,
-                tenant_name,
-                base_date,
-                baselines: decimals(&b.baselines, &reg, "Стартовые показания")?,
-                prices: decimals(&b.prices, &reg, "Тарифы")?,
-                sewer_price: match b
-                    .sewer_price
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    None => None,
-                    Some(p) => Some(
-                        parse_decimal(p)
-                            .ok_or(ApiError::User("Тариф водоотведения: нужно число.".into()))?
-                            .to_string(),
-                    ),
-                },
-            };
-            let id = st.app.create_property(landlord.id, &np, now).await?;
-            if let Some(proof) = b.proof_required {
-                set_proof(&st, id, proof).await?;
-            }
-            st.audit(
-                &ctx,
-                "property_create",
-                "property",
-                Some(id.to_string()),
-                json!({ "name": np.name }),
-            )
-            .await;
-            id
+            },
+        };
+        let id = st.app.create_property(landlord.id, &np, now).await?;
+        if let Some(proof) = b.proof_required {
+            set_proof(st, id, proof).await?;
         }
+        st.audit(
+            ctx,
+            "property_create",
+            "property",
+            Some(id.to_string()),
+            json!({ "name": np.name }),
+        )
+        .await;
+        id
+    };
+    Ok(id)
+}
+
+/// `POST /api/properties` — ещё одна квартира у владельца. Активной не становится: клиент сам выбирает объект заголовком.
+async fn post_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> ApiResult {
+    let id = create_from_body(&st, &ctx, &b).await?;
+    let user_id = match &ctx.role {
+        Role::Landlord(u) | Role::Tenant(u) => u.id,
+    };
+    st.app.set_active_property(user_id, id).await?;
+    let mut ctx = ctx;
+    if let Role::Landlord(u) = &mut ctx.role {
+        u.property_id = Some(id);
+    }
+    Ok(Json(
+        json!({ "property": property_json(&st, &ctx, id).await? }),
+    ))
+}
+
+/// `GET /api/properties` — объекты текущего пользователя с его ролью в каждом.
+async fn list_properties(State(st): St, ctx: Ctx) -> ApiResult {
+    let (user_id, active) = match &ctx.role {
+        Role::Landlord(u) | Role::Tenant(u) => (u.id, u.property_id),
+    };
+    let mut out = vec![];
+    for (pid, role) in st.app.memberships(user_id).await? {
+        let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
+            .bind(pid)
+            .fetch_one(st.app.pool())
+            .await?;
+        out.push(json!({ "id": pid, "name": name, "role": if role == MRole::Owner { "owner" } else { "tenant" }, "active": active == Some(pid) }));
+    }
+    Ok(Json(json!({ "properties": out })))
+}
+
+async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> ApiResult {
+    ctx.landlord()?;
+    let id = match st.property_of(&ctx).await? {
+        None => create_from_body(&st, &ctx, &b).await?,
         Some(id) => {
             if let Some(name) = clean_text(&b.name) {
                 sqlx::query("UPDATE property SET name = ? WHERE id = ?")
@@ -634,7 +743,7 @@ async fn meters(State(st): St, ctx: Ctx) -> ApiResult {
 // ---------- показания (арендатор) ----------
 
 async fn form_json(st: &ApiState, ctx: &Ctx) -> Result<Value, ApiError> {
-    let view = st.app.form_view(ctx.tenant()?.id, st.now()).await?;
+    let view = st.app.form_view(ctx.tenant()?, st.now()).await?;
     serde_json::to_value(view).map_err(|_| ApiError::Internal)
 }
 
@@ -649,7 +758,7 @@ struct ValueBody {
 }
 
 async fn draft_put(State(st): St, ctx: Ctx, Json(b): Json<ValueBody>) -> ApiResult {
-    let user = ctx.tenant()?.id;
+    let user = ctx.tenant()?;
     st.app
         .form_set_value(user, &b.code, &b.value, st.now())
         .await?;
@@ -671,7 +780,7 @@ async fn photo_upload(
     Query(q): Query<CodeQuery>,
     body: Bytes,
 ) -> ApiResult {
-    let user = ctx.tenant()?.id;
+    let user = ctx.tenant()?;
     if !looks_like_jpeg(&body) {
         return bad("Нужна фотография в формате JPEG.");
     }
@@ -703,14 +812,14 @@ async fn draft_photo(
     ctx: Ctx,
     Query(q): Query<CodeQuery>,
 ) -> Result<Response, ApiError> {
-    let user = ctx.tenant()?.id;
+    let user = ctx.tenant()?;
     read_photo(st.app.form_photo_path(user, &q.code, st.now()).await?).await
 }
 
 async fn submit(State(st): St, ctx: Ctx) -> ApiResult {
     let user = ctx.tenant()?.clone();
     let now = st.now();
-    let view = st.app.form_view(user.id, now).await?;
+    let view = st.app.form_view(&user, now).await?;
     if view.billed {
         // повторная отправка: ничего не меняется и никому не уходит
         return Ok(Json(
@@ -810,7 +919,7 @@ async fn tariffs_put(State(st): St, ctx: Ctx, Json(b): Json<TariffsBody>) -> Api
     }
     let replies = st
         .app
-        .change_tariffs(ctx.sender.chat_id, &month, &parsed, now)
+        .change_tariffs(ctx.sender.chat_id, property_id, &month, &parsed, now)
         .await?;
     st.audit(&ctx, "tariffs_update", "tariff", Some(month.clone()), json!({ "changes": b.changes.iter().map(|c| json!({ "code": c.code, "price": c.price, "off": c.off })).collect::<Vec<_>>() })).await;
     st.notify_others(&ctx, replies).await;
@@ -877,30 +986,43 @@ fn bill_summary(b: &BillRow) -> Value {
             "created_at": b.created_at, "decided_at": b.decided_at, "paid_at": b.paid_at })
 }
 
-/// Счёт, к которому есть доступ: владелец видит все счета своего объекта, арендатор — только утверждённые и оплаченные
-/// своей квартиры. Остальное — «не найдено», чтобы не раскрывать существование чужих и неутверждённых счетов.
-async fn bill_for(st: &ApiState, ctx: &Ctx, id: i64) -> Result<BillRow, ApiError> {
-    let sql = format!(
-        "SELECT {BILL_COLS} FROM bill b JOIN property p ON p.id = b.property_id WHERE b.id = ? AND p.landlord_id = ?"
-    );
-    let row: Option<BillTuple> = match &ctx.role {
-        Role::Landlord(u) => {
-            sqlx::query_as(&sql)
-                .bind(id)
-                .bind(u.id)
-                .fetch_optional(st.app.pool())
-                .await?
-        }
-        Role::Tenant(u) => {
-            let property_id = st.app.tenancy_of(u.id).await?;
-            sqlx::query_as(&format!("SELECT {BILL_COLS} FROM bill b WHERE b.id = ? AND b.property_id = ? AND b.status IN ('approved','paid')"))
-                .bind(id)
-                .bind(property_id)
-                .fetch_optional(st.app.pool())
-                .await?
-        }
+/// Счёт и роль пользователя в ЕГО объекте. Доступ определяется объектом счёта, а не «текущим» объектом запроса:
+/// владелец видит все счета своего объекта, арендатор — только утверждённые и оплаченные. Всё остальное (чужой счёт,
+/// неутверждённый счёт арендатору, несуществующий id) — одинаковое «не найдено», чтобы ничего не раскрывать.
+async fn bill_access(st: &ApiState, ctx: &Ctx, id: i64) -> Result<(BillRow, MRole), ApiError> {
+    let user_id = match &ctx.role {
+        Role::Landlord(u) | Role::Tenant(u) => u.id,
     };
-    row.map(BillRow::from).ok_or(ApiError::NotFound)
+    let row: Option<BillTuple> =
+        sqlx::query_as(&format!("SELECT {BILL_COLS} FROM bill b WHERE b.id = ?"))
+            .bind(id)
+            .fetch_optional(st.app.pool())
+            .await?;
+    let bill = BillRow::from(row.ok_or(ApiError::NotFound)?);
+    let role = st
+        .app
+        .role_in(user_id, bill.property_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if role == MRole::Tenant && bill.status != "approved" && bill.status != "paid" {
+        return Err(ApiError::NotFound);
+    }
+    Ok((bill, role))
+}
+
+async fn bill_for(st: &ApiState, ctx: &Ctx, id: i64) -> Result<BillRow, ApiError> {
+    Ok(bill_access(st, ctx, id).await?.0)
+}
+
+/// Действия владельца над счётом: роль проверяется в объекте самого счёта.
+async fn owner_bill(st: &ApiState, ctx: &Ctx, id: i64) -> Result<BillRow, ApiError> {
+    let (bill, role) = bill_access(st, ctx, id).await?;
+    if role != MRole::Owner {
+        return Err(ApiError::Forbidden(
+            "Это действие доступно только владельцу.",
+        ));
+    }
+    Ok(bill)
 }
 
 async fn bills_list(State(st): St, ctx: Ctx) -> ApiResult {
@@ -926,7 +1048,7 @@ async fn bills_list(State(st): St, ctx: Ctx) -> ApiResult {
 }
 
 async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
-    let b = bill_for(&st, &ctx, id).await?;
+    let (b, bill_role) = bill_access(&st, &ctx, id).await?;
     let snapshot: Value = serde_json::from_str(&b.snapshot).map_err(|_| ApiError::Internal)?;
     let readings: Vec<(i64, String, String, Option<String>, bool)> = sqlx::query_as(
         "SELECT r.id, g.code, r.value, r.read_on, r.photo_path IS NOT NULL FROM reading r JOIN register g ON g.id = r.register_id
@@ -936,7 +1058,7 @@ async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
     .bind(&b.period)
     .fetch_all(st.app.pool())
     .await?;
-    let landlord = matches!(ctx.role, Role::Landlord(_));
+    let landlord = bill_role == MRole::Owner;
     let mut v = bill_summary(&b);
     v["snapshot"] = snapshot;
     v["readings"] = json!(readings.iter().map(|(id, code, value, read_on, photo)| json!({ "reading_id": id, "code": code, "value": value, "read_on": read_on, "has_photo": photo })).collect::<Vec<_>>());
@@ -953,8 +1075,7 @@ async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
 /// Выполняет решение владельца через тот же сервис, что и кнопка в боте, и проверяет итоговый статус:
 /// устаревший или уже обработанный счёт — это 409, а не тихий успех.
 async fn decide(st: &ApiState, ctx: &Ctx, id: i64, action: &str, target: &str) -> ApiResult {
-    ctx.landlord()?;
-    let before = bill_for(st, ctx, id).await?;
+    let before = owner_bill(st, ctx, id).await?;
     let now = st.now();
     let replies = match action {
         "approve" => st.app.bill_approve(&ctx.sender, id, now).await?,
@@ -1007,8 +1128,7 @@ async fn bill_void(
     Path(id): Path<i64>,
     Json(b): Json<VoidBody>,
 ) -> ApiResult {
-    ctx.landlord()?;
-    let before = bill_for(&st, &ctx, id).await?;
+    let before = owner_bill(&st, &ctx, id).await?;
     let reason = b.reason.trim();
     if reason.is_empty() || reason.chars().count() > 200 {
         return bad("Причина — от 1 до 200 символов.");
@@ -1039,7 +1159,10 @@ async fn reading_photo(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> Result<R
     .fetch_optional(st.app.pool())
     .await?;
     let (property_id, path) = row.ok_or(ApiError::NotFound)?;
-    if st.property_of(&ctx).await? != Some(property_id) {
+    let user_id = match &ctx.role {
+        Role::Landlord(u) | Role::Tenant(u) => u.id,
+    };
+    if st.app.role_in(user_id, property_id).await?.is_none() {
         return Err(ApiError::NotFound);
     }
     read_photo(path).await
@@ -1068,8 +1191,10 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/auth/telegram", post(auth_telegram))
         .route("/me", get(me))
+        .route("/register", post(register))
         .route("/home", get(home))
         .route("/property", get(get_property).put(put_property))
+        .route("/properties", get(list_properties).post(post_property))
         .route("/invitations", post(create_invitation))
         .route("/meters", get(meters))
         .route(
