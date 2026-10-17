@@ -158,6 +158,33 @@ impl App {
         }
     }
 
+    /// `true` — это событие обрабатывается впервые; `false` — дубль (повторная доставка или второй экземпляр бота).
+    /// Ключ вставляется атомарно, поэтому даже при гонке двух процессов обработает только один.
+    pub async fn first_time(&self, key: &str, now: NaiveDateTime) -> bool {
+        let inserted =
+            sqlx::query("INSERT OR IGNORE INTO seen_update (key, created_at) VALUES (?, ?)")
+                .bind(key)
+                .bind(now_iso(now))
+                .execute(&self.pool)
+                .await;
+        match inserted {
+            Ok(r) => {
+                if r.rows_affected() == 1 {
+                    // записи старше недели не нужны
+                    let _ = sqlx::query("DELETE FROM seen_update WHERE created_at < ?")
+                        .bind(now_iso(now - chrono::Duration::days(7)))
+                        .execute(&self.pool)
+                        .await;
+                }
+                r.rows_affected() == 1
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "seen_update insert failed");
+                true
+            }
+        }
+    }
+
     /// Нужно ли скачивать фото от этого пользователя (чужим людям трафик не тратим).
     pub async fn accepts_photos_from(&self, telegram_id: i64) -> bool {
         telegram_id == self.cfg.landlord_telegram_id

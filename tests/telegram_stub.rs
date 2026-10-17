@@ -28,7 +28,12 @@ fn chat(id: i64) -> Value {
 }
 
 fn message(id: i64, extra: Value) -> Value {
-    let mut m = json!({"message_id": 10, "date": 1700000000, "chat": chat(id), "from": user(id)});
+    message_with_id(id, 10, extra)
+}
+
+fn message_with_id(id: i64, message_id: i64, extra: Value) -> Value {
+    let mut m =
+        json!({"message_id": message_id, "date": 1700000000, "chat": chat(id), "from": user(id)});
     m.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
@@ -151,7 +156,10 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
         json!({"update_id": 3, "callback_query": {"id": "cb1", "from": user(777), "chat_instance": "ci",
             "message": message(777, json!({"text": "карточка"})), "data": "ok:1"}}),
         // 4: /start с токеном от постороннего
-        json!({"update_id": 4, "message": message(777, json!({"text": "/start deadbeef", "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}))}),
+        json!({"update_id": 4, "message": message_with_id(777, 11, json!({"text": "/start deadbeef", "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}))}),
+        // 5 и 6: одно и то же сообщение доставлено дважды (message_id совпадает) — ответ должен быть один
+        json!({"update_id": 5, "message": message_with_id(777, 77, json!({"text": "/whoami", "entities": [{"type": "bot_command", "offset": 0, "length": 7}]}))}),
+        json!({"update_id": 6, "message": message_with_id(777, 77, json!({"text": "/whoami", "entities": [{"type": "bot_command", "offset": 0, "length": 7}]}))}),
     ];
     let (url, log) = start_stub(updates).await;
 
@@ -173,11 +181,13 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if log.lock().unwrap().sent.len() >= 4 || std::time::Instant::now() > deadline {
+        if log.lock().unwrap().sent.len() >= 5 || std::time::Instant::now() > deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // даём время обработать дубль: он не должен породить шестой ответ
+    tokio::time::sleep(Duration::from_secs(1)).await;
     runner.abort();
 
     let log = log.lock().unwrap();
