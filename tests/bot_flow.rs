@@ -115,8 +115,8 @@ impl H {
             .unwrap()
     }
 
-    /// Настройка объекта по данным golden dataset: июльские тарифы, дата baseline неизвестна.
-    async fn setup(&self, now: NaiveDateTime) {
+    /// Настройка объекта по данным golden dataset: июльские тарифы, дата baseline неизвестна. Настройки по умолчанию.
+    async fn setup_defaults(&self, now: NaiveDateTime) {
         self.say(LANDLORD, "/setup", now).await;
         for a in [
             "Квартира на Тверской",
@@ -139,11 +139,26 @@ impl H {
         assert!(r[0].text.contains("Объект сохранён"), "{r:?}");
     }
 
-    async fn connect_tenant(&self, now: NaiveDateTime) {
+    /// То же, но фото-подтверждение выключено: большинству сценариев фото не нужны (включается в своих тестах).
+    async fn setup(&self, now: NaiveDateTime) {
+        self.setup_defaults(now).await;
+        self.set_proof(false).await;
+    }
+
+    async fn set_proof(&self, on: bool) {
+        sqlx::query("UPDATE property SET proof_required = ?")
+            .bind(on)
+            .execute(self.app.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn connect_tenant(&self, now: NaiveDateTime) -> Vec<Reply> {
         let r = self.say(LANDLORD, "/invite", now).await;
         let token = r[0].text.split("start=").nth(1).unwrap().trim().to_string();
         let r = self.send(TENANT, Incoming::Start(Some(token)), now).await;
         assert!(r[0].text.contains("Вы подключены"), "{r:?}");
+        r
     }
 
     async fn ready() -> Self {
@@ -934,7 +949,7 @@ async fn duplicate_photo_never_duplicates_a_reading_or_a_charge() {
     // то же фото ещё раз до отправки: не принимается, форма не дублируется
     let again = h.photo(TENANT, "DUP", now).await;
     assert!(
-        again[0].text.contains("Повторно оно не учитывается"),
+        again[0].text.contains("нельзя использовать дважды"),
         "{again:?}"
     );
     assert_eq!(h.drafts().await, 1);
@@ -1020,7 +1035,7 @@ async fn low_confidence_photo_value_is_flagged_on_the_summary() {
         h.say(TENANT, v, now).await;
     }
     let r = h.say(TENANT, "1179", now).await;
-    assert!(all_text(&r).contains("📷⚠️ сверьте с фото"), "{r:?}");
+    assert!(all_text(&r).contains("📎⚠️ сверьте с фото"), "{r:?}");
 }
 
 #[tokio::test]
@@ -1160,5 +1175,242 @@ async fn tariff_history_shows_sewer_as_off_when_disabled() {
     assert!(
         r[0].text.contains("сейчас арендатор не оплачивает"),
         "{r:?}"
+    );
+}
+
+// ---------- фото как подтверждение показаний ----------
+
+impl H {
+    /// Готовый стенд с обязательным фото-подтверждением.
+    async fn ready_with_proof() -> Self {
+        let h = Self::ready().await;
+        h.set_proof(true).await;
+        h
+    }
+
+    /// Число, затем фото к нему (ИИ недоступен).
+    async fn value_then_photo(&self, value: &str, unique: &str, now: NaiveDateTime) -> Vec<Reply> {
+        self.say(TENANT, value, now).await;
+        self.photo(TENANT, unique, now).await
+    }
+}
+
+#[tokio::test]
+async fn proof_is_required_by_default_and_the_welcome_says_so() {
+    let h = H::new().await;
+    h.setup_defaults(at(2026, 6, 26)).await;
+    assert_eq!(
+        h.count("SELECT proof_required FROM property").await,
+        1,
+        "по умолчанию фото обязательно"
+    );
+    let welcome = h.connect_tenant(at(2026, 6, 26)).await;
+    assert!(
+        welcome[0].text.contains("приложите фото счётчика"),
+        "{welcome:?}"
+    );
+    let r = h.say(LANDLORD, "/status", at(2026, 6, 26)).await;
+    assert!(
+        r[0].text.contains("Фото-подтверждение: обязательно"),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn number_then_photo_attaches_proof_and_the_landlord_gets_the_photos() {
+    let h = H::ready_with_proof().await;
+    let now = at(2026, 7, 25);
+    let r = h.say(TENANT, "/enter", now).await;
+    assert!(all_text(&r).contains("нужно приложить фото"), "{r:?}");
+    let r = h.say(TENANT, "755", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Теперь пришлите фото") && !text.contains("Шаг 2"),
+        "без фото дальше не идём: {text}"
+    );
+    let r = h.photo(TENANT, "P-cold", now).await;
+    assert!(
+        all_text(&r).contains("Фото прикреплено") && all_text(&r).contains("Шаг 2 из 4"),
+        "{r:?}"
+    );
+
+    h.value_then_photo("417", "P-hot", now).await;
+    h.value_then_photo("3975", "P-t1", now).await;
+    let r = h.value_then_photo("1179", "P-t2", now).await;
+    let summary = all_text(&r);
+    assert!(summary.matches("📎").count() >= 4, "{summary}");
+    assert!(
+        !summary.contains("нет фото") && buttons(&r).contains(&"send".to_string()),
+        "{summary}"
+    );
+
+    let r = h.tap(TENANT, "send", now).await;
+    let draft = r
+        .iter()
+        .find(|x| x.chat_id == LANDLORD * 100 && !x.buttons.is_empty())
+        .expect("draft for landlord");
+    assert_eq!(draft.photos.len(), 4, "владелец получает все четыре фото");
+    assert_eq!(
+        draft.photos[0],
+        (
+            "file-P-cold".to_string(),
+            "Холодная вода (ХВС): 755".to_string()
+        )
+    );
+    assert!(
+        draft.text.contains("Фото-подтверждения всех показаний"),
+        "{}",
+        draft.text
+    );
+    assert_eq!(h.count("SELECT count(*) FROM reading WHERE kind = 'submitted' AND photo_file_id IS NOT NULL AND source = 'manual'").await, 4);
+}
+
+#[tokio::test]
+async fn photo_then_number_works_too() {
+    let h = H::ready_with_proof().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    let r = h.photo(TENANT, "P1", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("Фото сохранено как подтверждение") && text.contains("Шаг 1 из 4"),
+        "{text}"
+    );
+    let r = h.say(TENANT, "755", now).await;
+    assert!(
+        all_text(&r).contains("Шаг 2 из 4"),
+        "фото уже есть — сразу следующий шаг: {r:?}"
+    );
+    assert_eq!(h.drafts().await, 1, "число и фото — одна запись, а не две");
+}
+
+#[tokio::test]
+async fn sending_is_blocked_until_every_register_has_a_photo() {
+    let h = H::ready().await; // фото выключено: форму можно заполнить без фото
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    for v in ["755", "417", "3975", "1179"] {
+        h.say(TENANT, v, now).await;
+    }
+    // владелец включил требование уже после ввода
+    let r = h.tap(LANDLORD, "pr:on", now).await;
+    assert!(r[0].text.contains("обязательно"), "{r:?}");
+    let r = h.tap(TENANT, "send", now).await;
+    assert!(
+        r[0].text.contains("Не хватает фото") && r[0].text.contains("Холодная вода"),
+        "{r:?}"
+    );
+    assert_eq!(h.count("SELECT count(*) FROM bill").await, 0);
+
+    // через ✏️ добавляем фото к каждому счётчику; пока фото есть не у всех, кнопки «Отправить» на сводке нет
+    for (code, uid) in [("cold", "E1"), ("hot", "E2"), ("t1", "E3")] {
+        h.tap(TENANT, &format!("ed:{code}"), now).await;
+        let r = h.photo(TENANT, uid, now).await;
+        let text = all_text(&r);
+        assert!(
+            text.contains("Фото прикреплено") && text.contains("Проверьте показания"),
+            "{text}"
+        );
+        assert!(
+            text.contains("❌ нет фото"),
+            "на сводке видно, где фото ещё нет: {text}"
+        );
+        assert!(
+            !buttons(&r).contains(&"send".to_string()),
+            "кнопки «Отправить» нет, пока не хватает фото: {r:?}"
+        );
+    }
+    h.tap(TENANT, "ed:t2", now).await;
+    let r = h.photo(TENANT, "E4", now).await;
+    assert!(
+        buttons(&r).contains(&"send".to_string()),
+        "когда у всех есть фото, кнопка «Отправить» появляется: {r:?}"
+    );
+    h.tap(TENANT, "send", now).await;
+    assert_eq!(
+        h.count("SELECT count(*) FROM bill WHERE status = 'draft'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn recognition_cross_checks_the_typed_number_against_the_photo() {
+    let h = H::ready_with_proof().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    h.say(TENANT, "757", now).await; // арендатор ошибся
+    h.ocr.push(Ok(vec![cand("cold", "755", "high")]));
+    let r = h.photo(TENANT, "X1", now).await;
+    let text = all_text(&r);
+    assert!(
+        text.contains("На фото я вижу 755") && text.contains("вы ввели 757"),
+        "{text}"
+    );
+    // число не подменено молча: на сводке остаётся то, что ввёл арендатор
+    let (v, ai): (String, String) = sqlx::query_as("SELECT value, ai_value FROM pending_reading WHERE status = 'open' AND register_code = 'cold'")
+        .fetch_one(h.app.pool())
+        .await
+        .unwrap();
+    assert_eq!((v.as_str(), ai.as_str()), ("757", "755"));
+}
+
+#[tokio::test]
+async fn one_photo_cannot_prove_two_registers() {
+    let h = H::ready_with_proof().await;
+    let now = at(2026, 7, 25);
+    h.say(TENANT, "/enter", now).await;
+    h.value_then_photo("755", "SAME", now).await;
+    h.say(TENANT, "417", now).await;
+    let r = h.photo(TENANT, "SAME", now).await;
+    assert!(r[0].text.contains("нельзя использовать дважды"), "{r:?}");
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM pending_reading WHERE status = 'open' AND unique_id = 'SAME'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn proof_command_is_landlord_only_and_toggles_the_requirement() {
+    let h = H::ready().await;
+    let now = at(2026, 7, 25);
+    let r = h.say(LANDLORD, "/proof", now).await;
+    assert!(
+        r[0].text.contains("необязательно") && buttons(&r).contains(&"pr:on".to_string()),
+        "{r:?}"
+    );
+    h.tap(LANDLORD, "pr:on", now).await;
+    assert_eq!(h.count("SELECT proof_required FROM property").await, 1);
+    let r = h.tap(TENANT, "pr:off", now).await;
+    assert!(r[0].text.contains("недоступно"), "{r:?}");
+    assert_eq!(
+        h.count("SELECT proof_required FROM property").await,
+        1,
+        "арендатор не может отключить требование"
+    );
+    let r = h.say(TENANT, "/proof", now).await;
+    assert!(
+        !r[0].text.contains("Фото-подтверждение показаний сейчас"),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn landlord_is_told_when_no_photos_were_attached() {
+    let h = H::ready().await;
+    let r = h
+        .month(at(2026, 7, 25), ["755", "417", "3975", "1179"])
+        .await;
+    let draft = r
+        .iter()
+        .find(|x| x.chat_id == LANDLORD * 100 && !x.buttons.is_empty())
+        .unwrap();
+    assert!(
+        draft.photos.is_empty() && draft.text.contains("Фото к показаниям не приложены"),
+        "{}",
+        draft.text
     );
 }

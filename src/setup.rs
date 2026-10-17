@@ -378,6 +378,15 @@ impl App {
         .bind(property_id)
         .fetch_one(&mut *tx)
         .await?;
+        let required: bool = sqlx::query_scalar("SELECT proof_required FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let proof_note = if required {
+            "к каждому показанию приложите фото счётчика (владелец требует подтверждение), "
+        } else {
+            ""
+        };
         tx.commit().await?;
         Ok(vec![
             Reply::with_buttons(
@@ -385,7 +394,7 @@ impl App {
                 format!(
                     "Вы подключены к объекту «{name}».\n\nКак отправить показания (раз в месяц):\n\
                      1) нажмите «Ввести показания» (или /enter) и вводите числа по шагам: ХВС → ГВС → T1 → T2;\n\
-                     2) в конце проверьте сводку и нажмите «Отправить».\n\
+                     2) {proof_note}в конце проверьте сводку и нажмите «Отправить».\n\
                      Вместо ввода можно прислать фото счётчика — я прочитаю цифры, а вы проверите их на сводке.\n\
                      /readings — что уже введено, /cancel — отмена.{}",
                     if self.cfg.ocr_enabled {

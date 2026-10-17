@@ -216,10 +216,41 @@ impl App {
                 .bind(property_id)
                 .fetch_one(&self.pool)
                 .await?;
-        Ok(Reply::with_buttons(
+        // Фото-подтверждения показаний этого периода — владелец сверяет цифры с ними.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT g.code, r.photo_file_id FROM reading r JOIN register g ON g.id = r.register_id
+              WHERE g.property_id = ? AND r.period = ? AND r.kind = 'submitted' AND r.status = 'confirmed' AND r.photo_file_id IS NOT NULL",
+        )
+        .bind(property_id)
+        .bind(&d.snapshot.period)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut photos = vec![];
+        for (code, _, _) in REGISTERS {
+            if let Some((_, file_id)) = rows.iter().find(|r| r.0 == code) {
+                let value = d
+                    .snapshot
+                    .lines
+                    .iter()
+                    .find(|l| l.code == code)
+                    .map_or(String::new(), |l| {
+                        format!(": {}", num(l.current_raw.parse().unwrap_or_default()))
+                    });
+                photos.push((file_id.clone(), format!("{}{value}", label(code))));
+            }
+        }
+        let proof_note = match photos.len() {
+            0 => "Фото к показаниям не приложены.".to_string(),
+            n if n == REGISTERS.len() => "Фото-подтверждения всех показаний — выше.".to_string(),
+            n => format!(
+                "Фото-подтверждения приложены к {n} из {} показаний (выше).",
+                REGISTERS.len()
+            ),
+        };
+        let mut reply = Reply::with_buttons(
             chat,
             format!(
-                "📋 Расчёт за {} (черновик #{})\nАрендатор: {tenant}\n\n{}\n\nАрендатору пока ничего не отправлено.",
+                "📋 Расчёт за {} (черновик #{})\nАрендатор: {tenant}\n\n{}\n\n{proof_note}\nАрендатору пока ничего не отправлено.",
                 d.snapshot.period,
                 d.bill_id,
                 format_bill(&d.snapshot)
@@ -228,7 +259,9 @@ impl App {
                 ("✅ Утвердить и отправить", format!("ap:{}", d.bill_id)),
                 ("❌ Отклонить", format!("rj:{}", d.bill_id)),
             ]],
-        ))
+        );
+        reply.photos = photos;
+        Ok(reply)
     }
 
     async fn load_bill(&self, from: &Sender, id: i64) -> Res<(i64, String, String, Snapshot)> {
@@ -400,6 +433,7 @@ impl App {
             chat_id: from.chat_id,
             text: "Какой счёт оплачен?".into(),
             buttons,
+            photos: vec![],
         }])
     }
 }

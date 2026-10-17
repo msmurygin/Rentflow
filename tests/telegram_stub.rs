@@ -126,6 +126,10 @@ async fn start_stub(updates: Vec<Value>) -> (String, Arc<Mutex<Log>>) {
                     }
                     "answercallbackquery" => json!(true),
                     "editmessagereplymarkup" => message(777, json!({"text": "x"})),
+                    "sendphoto" => message(
+                        body_json["chat_id"].as_i64().unwrap_or(0),
+                        json!({"text": "photo"}),
+                    ),
                     "sendmessage" => {
                         let chat_id = body_json["chat_id"].as_i64().unwrap_or(0);
                         log.lock().unwrap().sent.push(body_json.clone());
@@ -234,5 +238,38 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
     assert!(
         texts.iter().any(|t| t.contains("недействительна")),
         "{texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn send_all_sends_photos_before_the_text_with_buttons() {
+    let (url, log) = start_stub(vec![]).await;
+    let bot = Bot::new(TOKEN).set_api_url(url.parse().unwrap());
+    let mut reply =
+        rentflow::app::Reply::with_buttons(100, "Расчёт", vec![vec![("Утвердить", "ap:1".into())]]);
+    reply.photos = vec![
+        ("file-A".into(), "Холодная вода: 755".into()),
+        ("file-B".into(), "Горячая вода: 417".into()),
+    ];
+    rentflow::bot::send_all(&bot, vec![reply]).await;
+
+    let log = log.lock().unwrap();
+    let order: Vec<&str> = log
+        .paths
+        .iter()
+        .filter_map(|p| p.rsplit('/').next())
+        .filter(|m| m.starts_with("Send"))
+        .collect();
+    assert_eq!(
+        order,
+        ["SendPhoto", "SendPhoto", "SendMessage"],
+        "фото уходят раньше текста с кнопками: {:?}",
+        log.paths
+    );
+    assert_eq!(log.sent.len(), 1, "текст с кнопками отправлен один раз");
+    assert!(
+        log.sent[0]["reply_markup"].is_object(),
+        "кнопки на месте: {}",
+        log.sent[0]
     );
 }

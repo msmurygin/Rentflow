@@ -8,7 +8,7 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     net::Download,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
 
 const MAX_PHOTO_BYTES: u32 = 12 * 1024 * 1024;
@@ -42,8 +42,17 @@ pub async fn run(bot: Bot, app: Arc<App>, tz_offset_hours: i64) {
         .await;
 }
 
-async fn send_all(bot: &Bot, replies: Vec<Reply>) {
+pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
     for r in replies {
+        for (file_id, caption) in &r.photos {
+            let sent = bot
+                .send_photo(ChatId(r.chat_id), InputFile::file_id(file_id.clone()))
+                .caption(caption.clone())
+                .await;
+            if let Err(e) = sent {
+                tracing::warn!(chat = r.chat_id, error = %e, "send_photo failed");
+            }
+        }
         let mut req = bot.send_message(ChatId(r.chat_id), r.text);
         if !r.buttons.is_empty() {
             let rows: Vec<Vec<InlineKeyboardButton>> = r

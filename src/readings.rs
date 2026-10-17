@@ -20,6 +20,33 @@ struct Draft {
     photo_path: Option<String>,
 }
 
+impl Draft {
+    fn has_photo(&self) -> bool {
+        self.file_id.is_some()
+    }
+}
+
+/// Строка формы по регистру: значение и/или уже приложенное фото (фото могло прийти раньше числа).
+struct Existing {
+    source: String,
+    value: Option<Decimal>,
+    ai_value: Option<String>,
+    ai_confidence: Option<String>,
+    file_id: Option<String>,
+    unique_id: Option<String>,
+    photo_path: Option<String>,
+}
+
+type ExistingRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 type DraftRow = (
     String,
     String,
@@ -185,6 +212,15 @@ impl App {
             },
             Self::status_text(&period, &got)
         );
+        let proof = self.proof_required(property_id).await?;
+        text.push_str(&format!(
+            "\nФото-подтверждение: {}",
+            if proof {
+                "обязательно (/proof)"
+            } else {
+                "необязательно (/proof)"
+            }
+        ));
         if !bills.is_empty() {
             text.push_str("\n\nСчета:");
             for (id, p, status, total) in bills {
@@ -361,6 +397,92 @@ impl App {
         Ok(())
     }
 
+    async fn proof_required(&self, property_id: i64) -> Res<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT proof_required FROM property WHERE id = ?")
+                .bind(property_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Строка формы по регистру (с числом, с фото или с тем и другим).
+    async fn existing_row(&self, user_id: i64, period: &str, code: &str) -> Res<Option<Existing>> {
+        let row: Option<ExistingRow> = sqlx::query_as(
+            "SELECT source, value, ai_value, ai_confidence, file_id, unique_id, photo_path
+               FROM pending_reading
+              WHERE user_id = ? AND period = ? AND register_code = ? AND status = 'open' LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(period)
+        .bind(code)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(source, value, ai_value, ai_confidence, file_id, unique_id, photo_path)| Existing {
+                source,
+                value: value.and_then(|v| v.parse().ok()),
+                ai_value,
+                ai_confidence,
+                file_id,
+                unique_id,
+                photo_path,
+            },
+        ))
+    }
+
+    /// Прикрепляет фото-подтверждение к регистру: к уже введённому значению либо отдельной строкой «пока без числа».
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_proof(
+        &self,
+        user_id: i64,
+        period: &str,
+        code: &str,
+        file_id: &str,
+        unique_id: &str,
+        photo_path: Option<&str>,
+        ai: Option<(&str, &str)>,
+        now: NaiveDateTime,
+    ) -> Res<()> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE pending_reading
+                SET file_id = ?, unique_id = ?, photo_path = ?,
+                    ai_value = COALESCE(?, ai_value), ai_confidence = COALESCE(?, ai_confidence)
+              WHERE user_id = ? AND period = ? AND register_code = ? AND status = 'open'",
+        )
+        .bind(file_id)
+        .bind(unique_id)
+        .bind(photo_path)
+        .bind(ai.map(|a| a.0))
+        .bind(ai.map(|a| a.1))
+        .bind(user_id)
+        .bind(period)
+        .bind(code)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO pending_reading
+                   (user_id, period, register_code, ai_value, ai_confidence, file_id, unique_id, photo_path, source, status, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', 'open', ?)",
+            )
+            .bind(user_id)
+            .bind(period)
+            .bind(code)
+            .bind(ai.map(|a| a.0))
+            .bind(ai.map(|a| a.1))
+            .bind(file_id)
+            .bind(unique_id)
+            .bind(photo_path)
+            .bind(now_iso(now))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Приглашение ввести значение для регистра `code`.
     async fn prompt(
         &self,
@@ -380,15 +502,15 @@ impl App {
         } else {
             format!("Шаг {} из {TOTAL} — {}", idx + 1, label(code))
         };
-        let hint = if idx == 0 && !edit {
-            "\nМожно и фото счётчика — я прочитаю цифры, а вы проверите."
+        let proof = if self.proof_required(property_id).await? {
+            "\n📎 К показанию нужно приложить фото счётчика — пришлите его до или после числа."
         } else {
-            ""
+            "\n📎 Можно приложить фото счётчика как подтверждение (необязательно)."
         };
         Ok(Reply::with_buttons(
             from.chat_id,
             format!(
-                "{head}\n{prev}\nВведите текущее показание числом (например, 761 или 761,5).{hint}"
+                "{head}\n{prev}\nВведите текущее показание числом (например, 761 или 761,5).{proof}"
             ),
             vec![vec![("🗑 Отмена", "cx".into())]],
         ))
@@ -402,7 +524,9 @@ impl App {
         period: &str,
         drafts: &[Draft],
     ) -> Res<Reply> {
+        let required = self.proof_required(property_id).await?;
         let mut lines = vec![format!("Проверьте показания за {period}:\n")];
+        let mut no_photo = vec![];
         for (code, lbl, unit) in REGISTERS {
             let Some(d) = drafts.iter().find(|d| d.code == code) else {
                 continue;
@@ -411,28 +535,42 @@ impl App {
                 Some(p) => format!(" (расход {} {unit})", num(d.value.floor() - p.floor())),
                 None => String::new(),
             };
-            let mark = if d.source == "photo" {
-                if matches!(d.ai_confidence.as_deref(), Some("low") | Some("medium")) {
-                    " 📷⚠️ сверьте с фото"
+            let mark = if d.has_photo() {
+                if matches!(d.ai_confidence.as_deref(), Some("low") | Some("medium"))
+                    && d.source == "photo"
+                {
+                    " 📎⚠️ сверьте с фото"
                 } else {
-                    " 📷"
+                    " 📎"
                 }
+            } else if required {
+                no_photo.push(lbl);
+                " ❌ нет фото"
             } else {
                 ""
             };
             lines.push(format!("• {lbl}: {} {unit}{usage}{mark}", num(d.value)));
         }
-        lines.push("\nВсё верно? Нажмите «Отправить» — расчёт уйдёт владельцу. Ошиблись в цифре — нажмите ✏️ рядом со счётчиком.".into());
-        Ok(Reply::with_buttons(
-            from.chat_id,
-            lines.join("\n"),
-            vec![
-                vec![("✅ Отправить показания", "send".into())],
-                vec![("✏️ ХВС", "ed:cold".into()), ("✏️ ГВС", "ed:hot".into())],
-                vec![("✏️ T1", "ed:t1".into()), ("✏️ T2", "ed:t2".into())],
-                vec![("🗑 Отмена", "cx".into())],
-            ],
-        ))
+        let mut rows = vec![];
+        if no_photo.is_empty() {
+            lines.push("\nВсё верно? Нажмите «Отправить» — расчёт уйдёт владельцу вместе с фото. Ошиблись в цифре — нажмите ✏️ рядом со счётчиком.".into());
+            rows.push(vec![("✅ Отправить показания", "send".to_string())]);
+        } else {
+            lines.push(format!(
+                "\nВладелец требует фото-подтверждение. Не хватает фото: {}.\nНажмите ✏️ нужного счётчика и пришлите фото.",
+                no_photo.join(", ")
+            ));
+        }
+        rows.push(vec![
+            ("✏️ ХВС", "ed:cold".to_string()),
+            ("✏️ ГВС", "ed:hot".to_string()),
+        ]);
+        rows.push(vec![
+            ("✏️ T1", "ed:t1".to_string()),
+            ("✏️ T2", "ed:t2".to_string()),
+        ]);
+        rows.push(vec![("🗑 Отмена", "cx".to_string())]);
+        Ok(Reply::with_buttons(from.chat_id, lines.join("\n"), rows))
     }
 
     /// Следующий шаг формы: приглашение к первому незаполненному регистру либо итоговая сводка.
@@ -470,6 +608,76 @@ impl App {
             }
         }
         Ok(replies)
+    }
+
+    /// Шаг для `code` закончен (число и, если нужно, фото есть): возвращаемся к сводке (правка) или идём дальше.
+    async fn finish_step(
+        &self,
+        from: &Sender,
+        property_id: i64,
+        period: &str,
+        user_id: i64,
+        edit: bool,
+        lead: String,
+    ) -> Res<Vec<Reply>> {
+        if edit {
+            self.clear_state(from.telegram_id).await?;
+            let drafts = self.load_drafts(user_id, period).await?;
+            if drafts.len() == TOTAL {
+                let mut replies = vec![Reply::text(from.chat_id, lead)];
+                replies.push(self.summary(from, property_id, period, &drafts).await?);
+                return Ok(replies);
+            }
+        }
+        self.next_step(from, property_id, period, user_id, Some(lead))
+            .await
+    }
+
+    /// `/proof`: сделать фото-подтверждение обязательным или необязательным.
+    pub(crate) async fn proof_cmd(&self, from: &Sender) -> Res<Vec<Reply>> {
+        let Some(property_id) = self.property_id().await? else {
+            return user_err("Объект не настроен. Начните с /setup");
+        };
+        let on = self.proof_required(property_id).await?;
+        Ok(vec![Reply::with_buttons(
+            from.chat_id,
+            format!(
+                "Фото-подтверждение показаний сейчас: {}.\n\nОбязательно — арендатор не сможет отправить показания, пока не приложит фото к каждому счётчику. Необязательно — фото можно приложить по желанию. Фото приходят вам вместе с расчётом.",
+                if on {
+                    "ОБЯЗАТЕЛЬНО"
+                } else {
+                    "необязательно"
+                }
+            ),
+            vec![vec![
+                ("📎 Обязательно", "pr:on".into()),
+                ("Необязательно", "pr:off".into()),
+            ]],
+        )])
+    }
+
+    pub(crate) async fn proof_set(&self, from: &Sender, mode: &str) -> Res<Vec<Reply>> {
+        let Some(property_id) = self.property_id().await? else {
+            return user_err("Объект не настроен. Начните с /setup");
+        };
+        let on = match mode {
+            "on" => true,
+            "off" => false,
+            _ => return user_err("Неизвестный режим."),
+        };
+        sqlx::query("UPDATE property SET proof_required = ? WHERE id = ?")
+            .bind(on)
+            .bind(property_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(vec![Reply::text(
+            from.chat_id,
+            if on {
+                "✅ Фото-подтверждение обязательно: без фото ко всем четырём счётчикам показания отправить нельзя."
+            } else {
+                "Фото-подтверждение необязательно."
+            },
+        )])
     }
 
     pub(crate) async fn entry_start(
@@ -549,12 +757,15 @@ impl App {
         text: &str,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let Some(State::Entry { code, edit }) = self.state(from.telegram_id).await? else {
-            return Ok(vec![Reply::with_buttons(
-                from.chat_id,
-                "Чтобы ввести показания, нажмите /enter или кнопку ниже. Можно прислать фото счётчика.",
-                vec![vec![("▶️ Ввести показания", "enter".into())]],
-            )]);
+        let (code, edit) = match self.state(from.telegram_id).await? {
+            Some(State::Entry { code, edit }) | Some(State::Proof { code, edit }) => (code, edit),
+            _ => {
+                return Ok(vec![Reply::with_buttons(
+                    from.chat_id,
+                    "Чтобы ввести показания, нажмите /enter или кнопку ниже. Можно прислать фото счётчика.",
+                    vec![vec![("▶️ Ввести показания", "enter".into())]],
+                )]);
+            }
         };
         let property_id = self.tenancy_of(u.id).await?;
         let period = self.open_period(property_id, now).await?;
@@ -573,21 +784,20 @@ impl App {
         if let Some(msg) = self.rejection(property_id, &code, &period, value).await? {
             return user_err(format!("{msg}\nВведите показание ещё раз."));
         }
-        // Правка значения, пришедшего с фото, не теряет ни фото, ни исходное предложение ИИ: они остаются в истории.
+        // Правка числа не теряет уже приложенное фото и исходное предложение ИИ: они остаются в истории.
         let existing = self
-            .load_drafts(u.id, &period)
+            .existing_row(u.id, &period, &code)
             .await?
-            .into_iter()
-            .find(|d| d.code == code && d.source == "photo");
+            .filter(|e| e.file_id.is_some());
         match &existing {
-            Some(d) => {
-                let ai = d.ai_value.as_deref().zip(d.ai_confidence.as_deref());
+            Some(e) => {
+                let ai = e.ai_value.as_deref().zip(e.ai_confidence.as_deref());
                 let photo = Some((
-                    d.file_id.as_deref().unwrap_or(""),
-                    d.unique_id.as_deref(),
-                    d.photo_path.as_deref(),
+                    e.file_id.as_deref().unwrap_or(""),
+                    e.unique_id.as_deref(),
+                    e.photo_path.as_deref(),
                 ));
-                self.save_draft(u.id, &period, &code, value, "photo", ai, photo, now)
+                self.save_draft(u.id, &period, &code, value, &e.source, ai, photo, now)
                     .await?;
             }
             None => {
@@ -596,21 +806,26 @@ impl App {
             }
         }
         let accepted = format!("✔ {}: {} {}", label(&code), num(value), unit(&code));
-        if edit {
-            self.clear_state(from.telegram_id).await?;
-            let drafts = self.load_drafts(u.id, &period).await?;
-            let mut replies = vec![Reply::text(from.chat_id, accepted)];
-            if drafts.len() == TOTAL {
-                replies.push(self.summary(from, property_id, &period, &drafts).await?);
-            } else {
-                replies.extend(
-                    self.next_step(from, property_id, &period, u.id, None)
-                        .await?,
-                );
-            }
-            return Ok(replies);
+        if existing.is_none() && self.proof_required(property_id).await? {
+            // число есть, фото ещё нет — ждём фото именно к этому счётчику
+            self.set_state(
+                from.telegram_id,
+                &State::Proof {
+                    code: code.clone(),
+                    edit,
+                },
+            )
+            .await?;
+            return Ok(vec![Reply::with_buttons(
+                from.chat_id,
+                format!(
+                    "{accepted}\n📎 Теперь пришлите фото счётчика «{}» — оно нужно владельцу как подтверждение.\nОшиблись в числе? Просто отправьте правильное.",
+                    label(&code)
+                ),
+                vec![vec![("🗑 Отмена", "cx".into())]],
+            )]);
         }
-        self.next_step(from, property_id, &period, u.id, Some(accepted))
+        self.finish_step(from, property_id, &period, u.id, edit, accepted)
             .await
     }
 
@@ -639,30 +854,192 @@ impl App {
         .await?;
         if used > 0 {
             return user_err(
-                "Это фото уже принято (или уже в вашей форме). Повторно оно не учитывается: /readings",
+                "Это фото уже принято (или уже в вашей форме). Одно фото нельзя использовать дважды: /readings",
             );
         }
+        let target = match self.state(from.telegram_id).await? {
+            Some(State::Entry { code, edit }) | Some(State::Proof { code, edit }) => {
+                Some((code, edit))
+            }
+            _ => None,
+        };
 
         let photo_path = self.save_photo(unique_id, bytes).await;
-        let candidates: Vec<Candidate> = match self.extractor.extract(bytes).await {
+        let ocr = self.extractor.extract(bytes).await;
+        if let Err(e) = &ocr {
+            tracing::warn!(error = %e, "photo recognition failed, falling back to manual entry");
+        }
+        match target {
+            Some((code, edit)) => {
+                self.photo_for_step(
+                    from,
+                    u,
+                    property_id,
+                    &period,
+                    &code,
+                    edit,
+                    file_id,
+                    unique_id,
+                    photo_path.as_deref(),
+                    ocr,
+                    now,
+                )
+                .await
+            }
+            None => {
+                self.photo_free(
+                    from,
+                    u,
+                    property_id,
+                    &period,
+                    file_id,
+                    unique_id,
+                    photo_path.as_deref(),
+                    ocr,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Фото пришло, пока открыт шаг конкретного счётчика: это подтверждение именно к нему.
+    #[allow(clippy::too_many_arguments)]
+    async fn photo_for_step(
+        &self,
+        from: &Sender,
+        u: &UserRow,
+        property_id: i64,
+        period: &str,
+        code: &str,
+        edit: bool,
+        file_id: &str,
+        unique_id: &str,
+        photo_path: Option<&str>,
+        ocr: Result<Vec<Candidate>, String>,
+        now: NaiveDateTime,
+    ) -> Res<Vec<Reply>> {
+        let existing = self.existing_row(u.id, period, code).await?;
+        let typed = existing.as_ref().and_then(|e| e.value);
+        // Распознавание — только подсказка; учитывается лишь значение именно этого счётчика.
+        let recognised = ocr
+            .as_ref()
+            .ok()
+            .and_then(|cands| cands.iter().find(|c| c.register.as_deref() == Some(code)))
+            .and_then(|c| {
+                Some((
+                    parse_decimal(c.value.as_deref()?)?,
+                    c.value.clone()?,
+                    c.confidence.clone(),
+                ))
+            });
+
+        if let Some(typed) = typed {
+            // число уже введено вручную: фото — доказательство к нему; ИИ сверяет
+            let ai = recognised
+                .as_ref()
+                .map(|(_, raw, conf)| (raw.as_str(), conf.as_str()));
+            self.attach_proof(u.id, period, code, file_id, unique_id, photo_path, ai, now)
+                .await?;
+            let mut lead = format!("📎 Фото прикреплено к «{}».", label(code));
+            if let Some((seen, _, _)) = &recognised
+                && seen.floor() != typed.floor()
+            {
+                lead.push_str(&format!(
+                    "\n⚠️ На фото я вижу {}, а вы ввели {}. Проверьте цифры (✏️ на сводке).",
+                    num(*seen),
+                    num(typed)
+                ));
+            }
+            return self
+                .finish_step(from, property_id, period, u.id, edit, lead)
+                .await;
+        }
+
+        // числа пока нет: берём подсказку ИИ, если она проходит проверку на прошлое показание
+        if let Some((value, raw, conf)) = recognised
+            && self
+                .rejection(property_id, code, period, value)
+                .await?
+                .is_none()
+        {
+            self.save_draft(
+                u.id,
+                period,
+                code,
+                value,
+                "photo",
+                Some((&raw, &conf)),
+                Some((file_id, Some(unique_id), photo_path)),
+                now,
+            )
+            .await?;
+            let lead = format!(
+                "📷 Распознано: {} = {} {}. Проверьте на итоговой сводке.",
+                label(code),
+                num(value),
+                unit(code)
+            );
+            return self
+                .finish_step(from, property_id, period, u.id, edit, lead)
+                .await;
+        }
+        // не распознано (или ИИ выключен): фото сохраняем как подтверждение и просим число
+        self.attach_proof(
+            u.id, period, code, file_id, unique_id, photo_path, None, now,
+        )
+        .await?;
+        self.set_state(
+            from.telegram_id,
+            &State::Entry {
+                code: code.into(),
+                edit,
+            },
+        )
+        .await?;
+        let why = if ocr.is_err() {
+            ""
+        } else {
+            " Цифры на нём я не смог уверенно прочитать."
+        };
+        let mut reply = self.prompt(from, property_id, period, code, edit).await?;
+        reply.text = format!(
+            "📎 Фото сохранено как подтверждение для «{}».{why}\n\n{}",
+            label(code),
+            reply.text
+        );
+        Ok(vec![reply])
+    }
+
+    /// Фото пришло вне шага: распознаём, какие счётчики на нём, и заполняем форму.
+    #[allow(clippy::too_many_arguments)]
+    async fn photo_free(
+        &self,
+        from: &Sender,
+        u: &UserRow,
+        property_id: i64,
+        period: &str,
+        file_id: &str,
+        unique_id: &str,
+        photo_path: Option<&str>,
+        ocr: Result<Vec<Candidate>, String>,
+        now: NaiveDateTime,
+    ) -> Res<Vec<Reply>> {
+        let candidates = match ocr {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "photo recognition failed, falling back to manual entry");
-                let lead = "Автоматическое распознавание сейчас недоступно. Введите показания вручную по шагам.".to_string();
+            Err(_) => {
+                let lead = "Автоматическое распознавание сейчас недоступно. Введите показания вручную по шагам и прикладывайте фото к каждому счётчику.".to_string();
                 return self
-                    .next_step(from, property_id, &period, u.id, Some(lead))
+                    .next_step(from, property_id, period, u.id, Some(lead))
                     .await;
             }
         };
         if candidates.is_empty() {
-            let lead =
-                "Не нашёл на фото показание счётчика. Введите его вручную или пришлите фото чётче."
-                    .to_string();
+            let lead = "Не нашёл на фото показание счётчика. Введите показания по шагам; фото к каждому счётчику можно приложить на его шаге.".to_string();
             return self
-                .next_step(from, property_id, &period, u.id, Some(lead))
+                .next_step(from, property_id, period, u.id, Some(lead))
                 .await;
         }
-
         let mut notes = vec![];
         let mut photo_attached = false;
         for c in candidates.iter().take(2) {
@@ -672,7 +1049,7 @@ impl App {
                 notes.push("⚠️ На фото не удалось надёжно определить счётчик или цифры — введите это показание вручную.".to_string());
                 continue;
             };
-            if let Some(msg) = self.rejection(property_id, &code, &period, value).await? {
+            if let Some(msg) = self.rejection(property_id, &code, period, value).await? {
                 notes.push(format!("⚠️ По фото: {msg}\nНе принято. Возможно, распознан не тот регистр — введите значение вручную."));
                 continue;
             }
@@ -681,12 +1058,12 @@ impl App {
             photo_attached = true;
             self.save_draft(
                 u.id,
-                &period,
+                period,
                 &code,
                 value,
                 "photo",
                 Some((c.value.as_deref().unwrap_or(""), c.confidence.as_str())),
-                Some((file_id, unique, photo_path.as_deref())),
+                Some((file_id, unique, photo_path)),
                 now,
             )
             .await?;
@@ -697,7 +1074,7 @@ impl App {
                 unit(&code)
             ));
         }
-        self.next_step(from, property_id, &period, u.id, Some(notes.join("\n")))
+        self.next_step(from, property_id, period, u.id, Some(notes.join("\n")))
             .await
     }
 
@@ -756,6 +1133,19 @@ impl App {
                 "Не хватает: {}. Продолжить ввод: /enter",
                 missing.join(", ")
             ));
+        }
+        if self.proof_required(property_id).await? {
+            let bare: Vec<&str> = drafts
+                .iter()
+                .filter(|d| !d.has_photo())
+                .map(|d| label(&d.code))
+                .collect();
+            if !bare.is_empty() {
+                return user_err(format!(
+                    "Владелец требует фото-подтверждение. Не хватает фото: {}.\nНажмите ✏️ нужного счётчика на сводке и пришлите фото.",
+                    bare.join(", ")
+                ));
+            }
         }
         for d in &drafts {
             if let Some(msg) = self

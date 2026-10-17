@@ -56,6 +56,8 @@ pub struct Reply {
     pub chat_id: i64,
     pub text: String,
     pub buttons: Vec<Vec<Button>>,
+    /// Фото (Telegram file_id, подпись), отправляются перед текстом: кнопки остаются под последним сообщением.
+    pub photos: Vec<(String, String)>,
 }
 
 impl Reply {
@@ -64,6 +66,7 @@ impl Reply {
             chat_id,
             text: text.into(),
             buttons: vec![],
+            photos: vec![],
         }
     }
 
@@ -87,6 +90,7 @@ impl Reply {
             chat_id,
             text: text.into(),
             buttons,
+            photos: vec![],
         }
     }
 }
@@ -125,6 +129,8 @@ pub enum State {
     /// Форма ввода показаний: ждём число для регистра `code`. `edit` — правка одного значения из итоговой сводки
     /// (после ввода возвращаемся к сводке), иначе идём к следующему незаполненному регистру.
     Entry { code: String, edit: bool },
+    /// Число для `code` уже введено, ждём фото-подтверждение (если оно обязательно).
+    Proof { code: String, edit: bool },
     /// Меню тарифов: выбрана ли дата, номер шага и ответы (`keep` | `off` | цена).
     Tariff {
         date: Option<String>,
@@ -316,6 +322,7 @@ impl App {
                 /invite — одноразовая ссылка для арендатора\n\
                 /status — показания и счета текущего периода\n\
                 /tariffs — история тарифов по каждой позиции\n\
+                /proof — фото-подтверждение показаний: обязательно или нет\n\
                 /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
@@ -364,6 +371,7 @@ impl App {
                 "/status" => self.landlord_status(from, now).await,
                 "/tariff" => self.tariff_cmd(from, u, text, now).await,
                 "/tariffs" => self.tariff_history(from, now).await,
+                "/proof" => self.proof_cmd(from).await,
                 "/paid" => self.paid_list(from).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
@@ -400,6 +408,7 @@ impl App {
             (Who::Landlord(_), "ap") => self.bill_approve(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rj") => self.bill_reject(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "pd") => self.bill_paid(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "pr") => self.proof_set(from, a.unwrap_or("")).await,
             (Who::Landlord(_), "th") => self.tariff_history(from, now).await,
             (Who::Landlord(_), "tnew") => self.tariff_start(from, now).await,
             (Who::Landlord(_), "td") => self.tariff_date(from, a.unwrap_or(""), now).await,
