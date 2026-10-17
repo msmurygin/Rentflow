@@ -56,8 +56,14 @@ async fn main() -> Result<()> {
     let pool = rentflow::db::connect(&database_url)
         .await
         .context("не удалось открыть базу")?;
-    let bot = Bot::new(token);
-    let me = bot.get_me().await.context("Telegram не принял токен")?;
+    let mut bot = Bot::new(token);
+    if let Some(url) = env("TELEGRAM_API_URL") {
+        bot = bot.set_api_url(url.parse().context("TELEGRAM_API_URL должен быть URL")?);
+    }
+    let me = bot.get_me().await.context(
+        "Не удалось подключиться к Telegram. Проверьте токен; если ошибка сетевая (HandshakeFailure, timeout) — \
+         api.telegram.org недоступен из вашей сети: задайте HTTPS_PROXY (http:// или socks5://) или TELEGRAM_API_URL, см. README → «Проблемы с сетью»",
+    )?;
     let bot_username = me.username().to_string();
     tracing::info!(%bot_username, "bot started");
 

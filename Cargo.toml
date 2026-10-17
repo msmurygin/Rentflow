@@ -10,7 +10,8 @@ async-trait = "0.1.92"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dotenvy = "0.15"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# socks: HTTPS_PROXY/ALL_PROXY=socks5://... работает и для клиента Telegram (feature объединяется с teloxide)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
