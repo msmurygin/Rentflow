@@ -1040,3 +1040,26 @@ async fn schedule_and_void_work_through_the_api() {
         .await;
     assert_eq!(v["items"].as_array().unwrap().len(), 5, "тарифы на месте");
 }
+
+#[tokio::test]
+async fn fractional_previous_readings_reach_the_client_in_machine_format() {
+    // регрессия: «0,5» (русский формат) ломал расчёт расхода на сводке — сервер отдаёт «0.5»
+    let api = Api::new().await;
+    let landlord = api.login(LANDLORD).await;
+    api.setup_property(&landlord).await;
+    sqlx::query("UPDATE reading SET value = '0.5' WHERE kind = 'baseline' AND register_id = (SELECT id FROM register WHERE code = 't2')")
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    let tenant = api.connect_tenant(&landlord).await;
+    let (_, f) = api
+        .call(Method::GET, "/api/readings/draft", Some(&tenant), None)
+        .await;
+    let t2 = f["registers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["code"] == "t2")
+        .unwrap();
+    assert_eq!(t2["previous"], "0.5");
+}

@@ -32,9 +32,14 @@ export function price(s: string | null | undefined): string {
 
 /** Целая часть: накопительные показания берутся без дробной части до вычитания. */
 export function usage(current: string, previous: string): string {
-  const c = BigInt(current.split('.')[0] || '0');
-  const p = BigInt(previous.split('.')[0] || '0');
-  return (c - p).toString();
+  const whole = (s: string): bigint | null => {
+    // запятая и пробелы — тоже допустимый ввод; «0,5» не должно ронять экран
+    const t = s.trim().replace(/\s/g, '').replace(',', '.');
+    return /^\d+(\.\d+)?$/.test(t) ? BigInt(t.split('.')[0]) : null;
+  };
+  const c = whole(current);
+  const p = whole(previous);
+  return c === null || p === null ? '—' : (c - p).toString();
 }
 
 export function isValidNumber(s: string): boolean {

@@ -589,7 +589,8 @@ impl App {
                 previous: self
                     .previous_value(property_id, code, &period)
                     .await?
-                    .map(num),
+                    // машинный формат (точка): локализует и считает клиент; «0,5» ломало расчёт расхода на сводке
+                    .map(|d| d.to_string()),
                 value: row.as_ref().and_then(|r| r.value).map(|v| v.to_string()),
                 has_photo: row.as_ref().is_some_and(|r| r.file_id.is_some()),
                 source: row.as_ref().map(|r| r.source.clone()),
