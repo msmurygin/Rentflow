@@ -7,6 +7,7 @@ fs.mkdirSync(OUT, { recursive: true });
 const j = async (m, p, t, b) => { const r = await fetch(BASE + '/api' + p, { method: m, headers: { 'content-type': 'application/json', ...(t ? { authorization: 'Bearer ' + t } : {}) }, body: b ? JSON.stringify(b) : undefined }); return r.json(); };
 const login = async (u) => (await j('POST', '/auth/telegram', null, { init_data: await (await fetch(`${BASE}/dev/init?user=${u}`)).text() })).token;
 const owner = await login(1);
+await j('POST', '/register', owner, {}); // владелец регистрируется сам (v0.3)
 await j('PUT', '/property', owner, { name: 'Кв', tenant_name: 'И', baselines: { cold: '1', hot: '1', t1: '1', t2: '1' }, prices: { cold: '1', hot: '1', t1: '1', t2: '1' }, sewer_price: '1', proof_required: true });
 const inv = (await j('POST', '/invitations', owner, {})).url.split('start=')[1];
 await fetch(`${BASE}/dev/accept?user=2&token=${inv}`);
