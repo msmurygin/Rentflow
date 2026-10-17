@@ -1,5 +1,6 @@
 //! RentFlow: Telegram-бот для расчёта коммунальных платежей между арендатором и владельцем.
 
+pub mod api;
 pub mod app;
 pub mod billing;
 pub mod bills;

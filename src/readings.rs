@@ -7,6 +7,7 @@ use crate::ocr::Candidate;
 use crate::util::*;
 use chrono::NaiveDateTime;
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 
 /// Черновое значение одного регистра (строка таблицы `pending_reading`).
 struct Draft {
@@ -57,6 +58,33 @@ type DraftRow = (
     Option<String>,
     Option<String>,
 );
+
+/// Регистр в форме ввода показаний (для Mini App).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FormRegister {
+    pub code: String,
+    pub label: String,
+    pub unit: String,
+    pub previous: Option<String>,
+    pub value: Option<String>,
+    pub has_photo: bool,
+    /// `manual` | `photo`: откуда число. `photo` — предложено ИИ, человек подтверждает.
+    pub source: Option<String>,
+    pub ai_value: Option<String>,
+    pub ai_confidence: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FormView {
+    pub period: String,
+    /// По периоду уже есть счёт — ввод закрыт.
+    pub billed: bool,
+    pub proof_required: bool,
+    pub ocr_enabled: bool,
+    pub registers: Vec<FormRegister>,
+    /// Все числа введены (и фото приложены, если они обязательны): можно отправлять.
+    pub complete: bool,
+}
 
 const TOTAL: usize = REGISTERS.len();
 
@@ -484,6 +512,230 @@ impl App {
         Ok(())
     }
 
+    /// Записывает введённое значение в форму. Правка числа не теряет уже приложенное фото и исходное
+    /// предложение ИИ: они остаются в истории. Возвращает, было ли к регистру фото.
+    pub(crate) async fn store_value(
+        &self,
+        user_id: i64,
+        period: &str,
+        code: &str,
+        value: Decimal,
+        now: NaiveDateTime,
+    ) -> Res<bool> {
+        let existing = self
+            .existing_row(user_id, period, code)
+            .await?
+            .filter(|e| e.file_id.is_some());
+        match &existing {
+            Some(e) => {
+                let ai = e.ai_value.as_deref().zip(e.ai_confidence.as_deref());
+                let photo = Some((
+                    e.file_id.as_deref().unwrap_or(""),
+                    e.unique_id.as_deref(),
+                    e.photo_path.as_deref(),
+                ));
+                self.save_draft(user_id, period, code, value, &e.source, ai, photo, now)
+                    .await?;
+            }
+            None => {
+                self.save_draft(user_id, period, code, value, "manual", None, None, now)
+                    .await?
+            }
+        }
+        Ok(existing.is_some())
+    }
+
+    /// Это фото уже учтено (подтверждённым показанием или открытой формой)?
+    async fn photo_used(&self, unique_id: &str) -> Res<bool> {
+        let used: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM reading WHERE photo_unique_id = ?1 AND status = 'confirmed')
+                  + (SELECT count(*) FROM pending_reading WHERE unique_id = ?1 AND status = 'open')",
+        )
+        .bind(unique_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(used > 0)
+    }
+
+    /// Состояние формы ввода показаний арендатора: период, по каждому регистру — прошлое, введённое, фото, подсказка ИИ.
+    pub async fn form_view(&self, user_id: i64, now: NaiveDateTime) -> Res<FormView> {
+        let property_id = self.tenancy_of(user_id).await?;
+        let period = self.open_period(property_id, now).await?;
+        let billed = self.period_billed(property_id, &period).await?;
+        let mut registers = vec![];
+        for (code, lbl, unit) in REGISTERS {
+            let row = self.existing_row(user_id, &period, code).await?;
+            registers.push(FormRegister {
+                code: code.into(),
+                label: lbl.into(),
+                unit: unit.into(),
+                previous: self
+                    .previous_value(property_id, code, &period)
+                    .await?
+                    .map(num),
+                value: row.as_ref().and_then(|r| r.value).map(|v| v.to_string()),
+                has_photo: row.as_ref().is_some_and(|r| r.file_id.is_some()),
+                source: row.as_ref().map(|r| r.source.clone()),
+                ai_value: row.as_ref().and_then(|r| r.ai_value.clone()),
+                ai_confidence: row.as_ref().and_then(|r| r.ai_confidence.clone()),
+            });
+        }
+        let proof_required = self.proof_required(property_id).await?;
+        let complete = registers
+            .iter()
+            .all(|r| r.value.is_some() && (r.has_photo || !proof_required));
+        Ok(FormView {
+            period,
+            billed,
+            proof_required,
+            ocr_enabled: self.cfg.ocr_enabled,
+            registers,
+            complete,
+        })
+    }
+
+    /// Значение регистра, введённое или исправленное вручную (проверка «не меньше прошлого» — здесь же).
+    pub async fn form_set_value(
+        &self,
+        user_id: i64,
+        code: &str,
+        raw: &str,
+        now: NaiveDateTime,
+    ) -> Res<()> {
+        if !is_register(code) {
+            return user_err("Неизвестный счётчик.");
+        }
+        let property_id = self.tenancy_of(user_id).await?;
+        let period = self.open_period(property_id, now).await?;
+        if self.period_billed(property_id, &period).await? {
+            return user_err(format!(
+                "За {period} расчёт уже отправлен владельцу — новые показания не принимаются."
+            ));
+        }
+        let Some(value) = parse_decimal(raw) else {
+            return user_err("Нужно число, например 761 или 761,5.");
+        };
+        if let Some(msg) = self.rejection(property_id, code, &period, value).await? {
+            return user_err(msg);
+        }
+        self.store_value(user_id, &period, code, value, now).await?;
+        Ok(())
+    }
+
+    /// Фото счётчика `code`: сохраняется как подтверждение; ИИ только предлагает значение (если ручного ещё нет),
+    /// человек подтверждает или исправляет. Недоступный ИИ не мешает: фото остаётся, число вводится вручную.
+    pub async fn form_photo(
+        &self,
+        user_id: i64,
+        code: &str,
+        bytes: &[u8],
+        now: NaiveDateTime,
+    ) -> Res<()> {
+        if !is_register(code) {
+            return user_err("Неизвестный счётчик.");
+        }
+        if bytes.is_empty() {
+            return user_err("Пустой файл.");
+        }
+        let property_id = self.tenancy_of(user_id).await?;
+        let period = self.open_period(property_id, now).await?;
+        if self.period_billed(property_id, &period).await? {
+            return user_err(format!(
+                "За {period} расчёт уже отправлен владельцу — новые показания не принимаются."
+            ));
+        }
+        let unique = hex::encode(Sha256::digest(bytes));
+        if self.photo_used(&unique).await? {
+            return user_err(
+                "Это фото уже принято (или уже в вашей форме). Одно фото нельзя использовать дважды.",
+            );
+        }
+        let path = self.save_photo(&unique, bytes).await;
+        let file_id = format!("local:{unique}");
+        let ocr = self.extractor.extract(bytes).await;
+        if let Err(e) = &ocr {
+            tracing::warn!(error = %e, "photo recognition failed, falling back to manual entry");
+        }
+        let recognised = ocr
+            .as_ref()
+            .ok()
+            .and_then(|c| c.iter().find(|c| c.register.as_deref() == Some(code)))
+            .and_then(|c| {
+                Some((
+                    parse_decimal(c.value.as_deref()?)?,
+                    c.value.clone()?,
+                    c.confidence.clone(),
+                ))
+            });
+        let typed = self
+            .existing_row(user_id, &period, code)
+            .await?
+            .and_then(|e| e.value);
+        match recognised {
+            Some((value, raw, conf)) if typed.is_none() => {
+                if self
+                    .rejection(property_id, code, &period, value)
+                    .await?
+                    .is_none()
+                {
+                    self.save_draft(
+                        user_id,
+                        &period,
+                        code,
+                        value,
+                        "photo",
+                        Some((&raw, &conf)),
+                        Some((&file_id, Some(&unique), path.as_deref())),
+                        now,
+                    )
+                    .await?;
+                } else {
+                    self.attach_proof(
+                        user_id,
+                        &period,
+                        code,
+                        &file_id,
+                        &unique,
+                        path.as_deref(),
+                        None,
+                        now,
+                    )
+                    .await?;
+                }
+            }
+            other => {
+                let ai = other.as_ref().map(|(_, r, c)| (r.as_str(), c.as_str()));
+                self.attach_proof(
+                    user_id,
+                    &period,
+                    code,
+                    &file_id,
+                    &unique,
+                    path.as_deref(),
+                    ai,
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Путь к фото регистра в открытой форме этого арендатора.
+    pub async fn form_photo_path(
+        &self,
+        user_id: i64,
+        code: &str,
+        now: NaiveDateTime,
+    ) -> Res<Option<String>> {
+        let property_id = self.tenancy_of(user_id).await?;
+        let period = self.open_period(property_id, now).await?;
+        Ok(self
+            .existing_row(user_id, &period, code)
+            .await?
+            .and_then(|e| e.photo_path))
+    }
+
     /// Приглашение ввести значение для регистра `code`.
     async fn prompt(
         &self,
@@ -785,29 +1037,9 @@ impl App {
         if let Some(msg) = self.rejection(property_id, &code, &period, value).await? {
             return user_err(format!("{msg}\nВведите показание ещё раз."));
         }
-        // Правка числа не теряет уже приложенное фото и исходное предложение ИИ: они остаются в истории.
-        let existing = self
-            .existing_row(u.id, &period, &code)
-            .await?
-            .filter(|e| e.file_id.is_some());
-        match &existing {
-            Some(e) => {
-                let ai = e.ai_value.as_deref().zip(e.ai_confidence.as_deref());
-                let photo = Some((
-                    e.file_id.as_deref().unwrap_or(""),
-                    e.unique_id.as_deref(),
-                    e.photo_path.as_deref(),
-                ));
-                self.save_draft(u.id, &period, &code, value, &e.source, ai, photo, now)
-                    .await?;
-            }
-            None => {
-                self.save_draft(u.id, &period, &code, value, "manual", None, None, now)
-                    .await?
-            }
-        }
+        let had_photo = self.store_value(u.id, &period, &code, value, now).await?;
         let accepted = format!("✔ {}: {} {}", label(&code), num(value), unit(&code));
-        if existing.is_none() && self.proof_required(property_id).await? {
+        if !had_photo && self.proof_required(property_id).await? {
             // число есть, фото ещё нет — ждём фото именно к этому счётчику
             self.set_state(
                 from.telegram_id,
@@ -846,14 +1078,7 @@ impl App {
                 "За {period} расчёт уже отправлен владельцу — новые показания не принимаются."
             ));
         }
-        let used: i64 = sqlx::query_scalar(
-            "SELECT (SELECT count(*) FROM reading WHERE photo_unique_id = ?1 AND status = 'confirmed')
-                  + (SELECT count(*) FROM pending_reading WHERE unique_id = ?1 AND status = 'open')",
-        )
-        .bind(unique_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if used > 0 {
+        if self.photo_used(unique_id).await? {
             return user_err(
                 "Это фото уже принято (или уже в вашей форме). Одно фото нельзя использовать дважды: /readings",
             );

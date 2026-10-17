@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     let pool = rentflow::db::connect(&database_url)
         .await
         .context("не удалось открыть базу")?;
-    let mut bot = Bot::new(token);
+    let mut bot = Bot::new(token.clone());
     if let Some(url) = env("TELEGRAM_API_URL") {
         bot = bot.set_api_url(url.parse().context("TELEGRAM_API_URL должен быть URL")?);
     }
@@ -84,6 +84,39 @@ async fn main() -> Result<()> {
         },
         extractor,
     ));
+
+    // HTTP API для Mini App работает рядом с ботом в том же процессе и на той же базе.
+    if let Some(bind) = env("HTTP_BIND").or_else(|| Some("0.0.0.0:8080".into())) {
+        let state = Arc::new(rentflow::api::ApiState::new(
+            app.clone(),
+            Arc::new(rentflow::api::TelegramNotifier(bot.clone())),
+            token.clone(),
+            tz_offset_hours,
+        ));
+        let router = rentflow::api::router(state, env("WEB_DIR").map(PathBuf::from));
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("не удалось занять HTTP_BIND={bind}"))?;
+        tracing::info!(%bind, "http api started");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "http api stopped");
+            }
+        });
+    }
+    // Кнопка «Открыть» в чате с ботом ведёт в Mini App (то же, что настройка Menu Button в BotFather).
+    if let Some(url) = env("MINIAPP_URL") {
+        use teloxide::types::{MenuButton, WebAppInfo};
+        let button = MenuButton::WebApp {
+            text: "RentFlow".into(),
+            web_app: WebAppInfo {
+                url: url.parse().context("MINIAPP_URL должен быть https-URL")?,
+            },
+        };
+        if let Err(e) = bot.set_chat_menu_button().menu_button(button).await {
+            tracing::warn!(error = %e, "не удалось задать кнопку меню Mini App");
+        }
+    }
     rentflow::bot::run(bot, app, tz_offset_hours).await;
     Ok(())
 }

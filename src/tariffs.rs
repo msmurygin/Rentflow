@@ -9,11 +9,12 @@ use crate::util::*;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 
-const CODES: [&str; 5] = ["cold", "hot", "sewer", "t1", "t2"];
+pub(crate) const CODES: [&str; 5] = ["cold", "hot", "sewer", "t1", "t2"];
 const TOTAL: usize = CODES.len();
 
 /// Изменение одной позиции.
-pub(crate) enum Change {
+#[derive(Clone)]
+pub enum Change {
     Price(Decimal),
     /// Только водоотведение: с этого месяца арендатор его не оплачивает.
     Off,
@@ -40,7 +41,12 @@ fn show(row: &TariffRow) -> String {
 
 impl App {
     /// Тариф позиции, действующий в месяце `month`.
-    async fn tariff_at(&self, property_id: i64, code: &str, month: &str) -> Res<Option<TariffRow>> {
+    pub(crate) async fn tariff_at(
+        &self,
+        property_id: i64,
+        code: &str,
+        month: &str,
+    ) -> Res<Option<TariffRow>> {
         let versions = self.tariff_versions(property_id, code).await?;
         Ok(effective_tariff(&versions, month).cloned())
     }
@@ -503,5 +509,44 @@ impl App {
         }];
         replies.extend(self.refresh_drafts(property_id, month, now).await?);
         Ok(replies)
+    }
+}
+
+impl App {
+    /// Несколько изменений одним запросом (Mini App): те, что ничего не меняют, отбрасываются;
+    /// если не осталось ни одного — «менять нечего». Остальное — как у `/tariff`.
+    pub async fn change_tariffs(
+        &self,
+        chat: i64,
+        month: &str,
+        changes: &[(&str, Change)],
+        now: NaiveDateTime,
+    ) -> Res<Vec<Reply>> {
+        let Some(property_id) = self.property_id().await? else {
+            return user_err("Объект не настроен.");
+        };
+        let mut effective = vec![];
+        for (code, change) in changes {
+            let current = self.tariff_at(property_id, code, month).await?;
+            let unchanged = match (change, &current) {
+                (Change::Price(p), Some(r)) => r.enabled && r.price == *p,
+                (Change::Off, c) => !c.as_ref().is_some_and(|r| r.enabled),
+                _ => false,
+            };
+            if !unchanged {
+                effective.push((*code, change.clone_change()));
+            }
+        }
+        if effective.is_empty() {
+            return user_err("Менять нечего: эти тарифы уже действуют в выбранном месяце.");
+        }
+        self.apply_tariffs(chat, property_id, month, &effective, now)
+            .await
+    }
+}
+
+impl Change {
+    fn clone_change(&self) -> Change {
+        self.clone()
     }
 }

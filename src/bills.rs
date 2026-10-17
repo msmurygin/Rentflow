@@ -295,7 +295,8 @@ impl App {
                 .await?;
         // Фото-подтверждения показаний этого периода — владелец сверяет цифры с ними.
         let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT g.code, r.photo_file_id FROM reading r JOIN register g ON g.id = r.register_id
+            "SELECT g.code, CASE WHEN r.photo_file_id LIKE 'local:%' THEN 'local:' || r.photo_path ELSE r.photo_file_id END
+               FROM reading r JOIN register g ON g.id = r.register_id
               WHERE g.property_id = ? AND r.period = ? AND r.kind = 'submitted' AND r.status = 'confirmed' AND r.photo_file_id IS NOT NULL",
         )
         .bind(property_id)

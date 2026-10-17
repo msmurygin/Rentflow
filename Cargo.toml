@@ -6,15 +6,20 @@ default-run = "rentflow"
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "multipart"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs", "limit"] }
 async-trait = "0.1.92"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dotenvy = "0.15"
+hex = "0.4"
+hmac = "0.12"
 # socks: HTTPS_PROXY/ALL_PROXY=socks5://... работает и для клиента Telegram (feature объединяется с teloxide)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 thiserror = "2"
@@ -22,6 +27,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+form_urlencoded = "1"
 
 [dev-dependencies]
+http-body-util = "0.1"
 rust_decimal_macros = "1"
+tower = "0.5"

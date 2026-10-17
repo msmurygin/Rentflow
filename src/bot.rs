@@ -45,8 +45,19 @@ pub async fn run(bot: Bot, app: Arc<App>, tz_offset_hours: i64) {
 pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
     for r in replies {
         for (file_id, caption) in &r.photos {
+            // `local:<путь>` — фото из Mini App: у Telegram file_id нет, отправляем файл с диска
+            let file = match file_id.strip_prefix("local:") {
+                Some(path) => match tokio::fs::read(path).await {
+                    Ok(bytes) => InputFile::memory(bytes).file_name("meter.jpg"),
+                    Err(e) => {
+                        tracing::warn!(path, error = %e, "local photo unreadable");
+                        continue;
+                    }
+                },
+                None => InputFile::file_id(file_id.clone()),
+            };
             let sent = bot
-                .send_photo(ChatId(r.chat_id), InputFile::file_id(file_id.clone()))
+                .send_photo(ChatId(r.chat_id), file)
                 .caption(caption.clone())
                 .await;
             if let Err(e) = sent {
