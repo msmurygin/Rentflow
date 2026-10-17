@@ -921,7 +921,7 @@ async fn schedule_and_void_work_through_the_api() {
             Method::PUT,
             "/api/property",
             Some(&landlord),
-            Some(json!({ "reading_day": 31 })),
+            Some(json!({ "reading_day": 32 })),
         )
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1174,4 +1174,133 @@ async fn fractional_previous_readings_reach_the_client_in_machine_format() {
         .find(|r| r["code"] == "t2")
         .unwrap();
     assert_eq!(t2["previous"], "0.5");
+}
+
+#[tokio::test]
+async fn approved_bills_get_a_deadline_and_turn_overdue_after_it() {
+    let api = Api::new().await;
+    let landlord = api.login_owner(LANDLORD).await;
+    api.setup_property(&landlord).await;
+    sqlx::query("UPDATE property SET proof_required = 0")
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    let tenant = api.connect_tenant(&landlord).await;
+    for (code, value) in [
+        ("cold", "755"),
+        ("hot", "417"),
+        ("t1", "3975,48"),
+        ("t2", "1179"),
+    ] {
+        api.call(
+            Method::PUT,
+            "/api/readings/draft",
+            Some(&tenant),
+            Some(json!({ "code": code, "value": value })),
+        )
+        .await;
+    }
+    api.call(
+        Method::POST,
+        "/api/readings/submit",
+        Some(&tenant),
+        Some(json!({})),
+    )
+    .await;
+    let (_, v) = api
+        .call(Method::GET, "/api/bills", Some(&landlord), None)
+        .await;
+    let id = v["bills"][0]["id"].as_i64().unwrap();
+    assert!(
+        v["bills"][0]["due_date"].is_null() && v["bills"][0]["overdue"] == false,
+        "у черновика срока оплаты нет"
+    );
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/approve"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (d["due_date"].as_str(), d["overdue"].clone()),
+        (Some("2026-10-26"), json!(false)),
+        "16 октября + 10 дней"
+    );
+    // история расхода: утверждённый счёт, по каждой услуге расход и сумма; арендатор видит то же
+    for tok in [&landlord, &tenant] {
+        let (s, h) = api.call(Method::GET, "/api/history", Some(tok), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let m = &h["months"][0];
+        assert_eq!(
+            (m["period"].as_str(), m["total"].as_str()),
+            (Some("2026-10"), Some("2063.61"))
+        );
+        let cold = m["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["code"] == "cold")
+            .unwrap();
+        assert_eq!(cold["usage"], "2");
+        assert_eq!(m["lines"].as_array().unwrap().len(), 5);
+    }
+    // срок прошёл — просрочен (и арендатор это тоже видит)
+    sqlx::query("UPDATE bill SET due_date = '2026-10-15' WHERE id = ?")
+        .bind(id)
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    for tok in [&landlord, &tenant] {
+        let (_, v) = api.call(Method::GET, "/api/bills", Some(tok), None).await;
+        assert_eq!(v["bills"][0]["overdue"], true);
+    }
+    // срок — сегодня: ещё не просрочен
+    sqlx::query("UPDATE bill SET due_date = '2026-10-16' WHERE id = ?")
+        .bind(id)
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(d["overdue"], false);
+    // после оплаты просрочки нет, даже если срок давно прошёл
+    sqlx::query("UPDATE bill SET due_date = '2026-01-01' WHERE id = ?")
+        .bind(id)
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/paid"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (d["status"].as_str(), d["overdue"].clone()),
+        (Some("paid"), json!(false))
+    );
 }

@@ -42,6 +42,7 @@
     sewer_on: true,
     sewer_price: '',
     reading_day: '',
+    payment_days: '10',
     proof_required: true,
   });
 
@@ -63,9 +64,10 @@
       prices: pick(d.prices),
       sewer_price: d.sewer_on ? d.sewer_price : null,
       reading_day: d.reading_day.trim() ? Number(d.reading_day) : 0,
+      payment_days: Number(d.payment_days) || 10,
       proof_required: d.proof_required,
       // служебные поля интерфейса: нужны, чтобы при возобновлении экран выглядел как прежде
-      _ui: { sewer_on: d.sewer_on, sewer_price: d.sewer_price, baselines: d.baselines, prices: d.prices, enabled: d.enabled, reading_day: d.reading_day },
+      _ui: { sewer_on: d.sewer_on, sewer_price: d.sewer_price, baselines: d.baselines, prices: d.prices, enabled: d.enabled, reading_day: d.reading_day, payment_days: d.payment_days },
     };
   }
 
@@ -82,6 +84,7 @@
     d.sewer_on = ui.sewer_on ?? true;
     d.sewer_price = ui.sewer_price ?? '';
     d.reading_day = ui.reading_day ?? '';
+    d.payment_days = ui.payment_days ?? '10';
   }
 
   onMount(async () => {
@@ -115,7 +118,8 @@
       for (const c of CODES) if (on(c) && !isValidNumber(d.prices[c])) e[`p_${c}`] = 'Нужно число';
       if (d.sewer_on && !isValidNumber(d.sewer_price)) e.sewer = 'Нужно число';
     }
-    if (s === 4 && d.reading_day.trim() && !/^([1-9]|1\d|2[0-8])$/.test(d.reading_day.trim())) e.day = 'Число от 1 до 28';
+    if (s === 4 && !/^([1-9]|[1-8]\d|90)$/.test(d.payment_days.trim())) e.pay = 'Число от 1 до 90';
+    if (s === 4 && d.reading_day.trim() && !/^([1-9]|[12]\d|3[01])$/.test(d.reading_day.trim())) e.day = 'Число от 1 до 31 (29–31 — последний день месяца)';
     errors = e;
     return Object.keys(e).length === 0;
   }
@@ -236,6 +240,7 @@
     {:else if step === 4}
       <Card class="grid gap-3">
         <Field label={t('wizard.dayOptional')} bind:value={d.reading_day} inputmode="numeric" hint={t('wizard.dayHint')} error={errors.day} placeholder="25" />
+        <Field label={t('property.paymentDays')} bind:value={d.payment_days} inputmode="numeric" hint={t('property.paymentDaysHint')} error={errors.pay} />
         <label class="flex items-center justify-between gap-3">
           <span>{t('property.proof')}</span>
           <input type="checkbox" class="size-6 accent-[var(--brand)]" bind:checked={d.proof_required} />

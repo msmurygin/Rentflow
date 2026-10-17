@@ -381,10 +381,18 @@ impl App {
     ) -> Res<Vec<Reply>> {
         let (property_id, period, status, snap) = self.load_bill(from, id).await?;
         // Решение принимается ровно один раз: повторное нажатие ничего не рассылает.
+        // срок оплаты фиксируется в момент утверждения: число дней задаёт владелец (по умолчанию 10)
+        let payment_days: i64 =
+            sqlx::query_scalar("SELECT payment_days FROM property WHERE id = ?")
+                .bind(property_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let due = now.date() + chrono::Duration::days(payment_days);
         let done = sqlx::query(
-            "UPDATE bill SET status = 'approved', decided_at = ? WHERE id = ? AND status = 'draft'",
+            "UPDATE bill SET status = 'approved', decided_at = ?, due_date = ? WHERE id = ? AND status = 'draft'",
         )
         .bind(now_iso(now))
+        .bind(due.to_string())
         .bind(id)
         .execute(&self.pool)
         .await?;

@@ -215,9 +215,11 @@ async fn main() -> Result<()> {
         let (bot, app) = (bot.clone(), app.clone());
         tokio::spawn(async move {
             loop {
-                let now = chrono::Utc::now().naive_utc() + chrono::Duration::hours(tz_offset_hours);
-                match app.due_reminders(now).await {
-                    Ok(replies) => rentflow::bot::send_all(&bot, replies).await,
+                // у каждой квартиры свой часовой пояс — функции нужно «сырое» время UTC
+                match app.due_reminders(chrono::Utc::now().naive_utc()).await {
+                    Ok(replies) => {
+                        rentflow::bot::send_logged(&bot, &app, "reminder", replies).await
+                    }
                     Err(e) => tracing::error!(error = %e, "reminders failed"),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;

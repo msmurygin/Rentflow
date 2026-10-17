@@ -58,7 +58,7 @@
             <Card class="bg-brand! text-brandfg!">
               <div class="flex items-center justify-between text-sm opacity-80">
                 <span>{t('home.lastBill')} · {monthName(b.period)}</span>
-                <Badge status={b.status} onBrand />
+                <Badge status={b.status} onBrand overdue={d.bills.find((x) => x.id === b.id)?.overdue} />
               </div>
               <div class="num mt-2 text-4xl font-bold tracking-tight">{money(b.total)}</div>
             </Card>

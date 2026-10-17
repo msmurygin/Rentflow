@@ -28,6 +28,7 @@ export interface Property {
   tenant_name: string;
   tenant_connected: boolean;
   reading_day: number | null;
+  payment_days: number;
   proof_required?: boolean;
   registers: Register[];
 }
@@ -40,6 +41,15 @@ export interface BillSummary {
   created_at: string;
   decided_at: string | null;
   paid_at: string | null;
+  due_date: string | null;
+  overdue: boolean;
+}
+export interface HistoryMonth {
+  bill_id: number;
+  period: string;
+  status: BillStatus;
+  total: string;
+  lines: { code: string; usage: string; amount: string }[];
 }
 export interface Home {
   role: Role;

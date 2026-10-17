@@ -422,3 +422,60 @@ async fn a_tenant_joins_from_inside_the_app() {
         1
     );
 }
+
+#[tokio::test]
+async fn schedule_and_payment_term_chosen_in_the_wizard_are_applied_on_creation() {
+    let w = World::new().await;
+    let o = w.owner(OWNER_A).await;
+    let mut body = full_body("Кв");
+    body["reading_day"] = json!(31);
+    body["payment_days"] = json!(14);
+    let (s, v) = w
+        .call(Method::POST, "/api/properties", Some(&o), None, Some(body))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        (
+            v["property"]["reading_day"].clone(),
+            v["property"]["payment_days"].clone()
+        ),
+        (json!(31), json!(14))
+    );
+    let (last, days): (i64, i64) =
+        sqlx::query_as("SELECT reading_last, payment_days FROM property")
+            .fetch_one(w.app.pool())
+            .await
+            .unwrap();
+    assert_eq!((last, days), (1, 14));
+    // недопустимый срок оплаты — отказ, квартира не создаётся
+    let mut bad = full_body("Другая");
+    bad["payment_days"] = json!(200);
+    let (s, _) = w
+        .call(Method::POST, "/api/properties", Some(&o), None, Some(bad))
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        count(&w, "SELECT count(*) FROM property").await,
+        1,
+        "отказ не оставляет полусозданную квартиру"
+    );
+}
+
+#[tokio::test]
+async fn failed_deliveries_are_counted_in_the_vitals_without_message_text() {
+    let w = World::new().await;
+    let now = chrono::Utc::now().naive_utc();
+    let before = w.app.vitals(now, now.and_utc().timestamp()).await;
+    assert_eq!(before.failed_deliveries_24h, 0);
+    w.app
+        .record_failed_delivery(now, 42, "reminder", "bot_blocked")
+        .await;
+    let after = w.app.vitals(now, now.and_utc().timestamp()).await;
+    assert_eq!(after.failed_deliveries_24h, 1);
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('notification_log')")
+            .fetch_all(w.app.pool())
+            .await
+            .unwrap();
+    assert!(!cols.iter().any(|c| c == "text" || c == "body"));
+}

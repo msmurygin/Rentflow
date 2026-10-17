@@ -22,6 +22,7 @@
   let name = $state('');
   let tenant = $state('');
   let readingDay = $state('');
+  let paymentDays = $state('');
   let errors = $state<Record<string, string>>({});
   let busy = $state(false);
 
@@ -75,7 +76,7 @@
             <p class="text-sm text-muted">{p.tenant_name} · {p.tenant_connected ? t('property.connected') : t('property.notConnected')}</p>
           </div>
           {#if landlord}
-            <button class="text-sm font-semibold text-brand" onclick={() => { name = p.name; tenant = p.tenant_name; readingDay = p.reading_day ? String(p.reading_day) : ''; errors = {}; editing = !editing; }}>{t('property.edit')}</button>
+            <button class="text-sm font-semibold text-brand" onclick={() => { name = p.name; tenant = p.tenant_name; readingDay = p.reading_day ? String(p.reading_day) : ''; paymentDays = String(p.payment_days); errors = {}; editing = !editing; }}>{t('property.edit')}</button>
           {/if}
         </div>
 
@@ -84,12 +85,13 @@
             <Field label={t('property.name')} bind:value={name} />
             <Field label={t('property.tenant')} bind:value={tenant} />
             <Field label={t('property.readingDay')} bind:value={readingDay} inputmode="numeric" hint={t('property.readingDayHint')} error={errors.readingDay} />
-            <Btn {busy} onclick={() => { if (readingDay.trim() && !/^([1-9]|1\d|2[0-8])$/.test(readingDay.trim())) { errors.readingDay = 'Число от 1 до 28'; return; } errors.readingDay = ''; void patch({ name, tenant_name: tenant, reading_day: readingDay.trim() ? Number(readingDay) : 0 }); }}>{t('save')}</Btn>
+            <Field label={t('property.paymentDays')} bind:value={paymentDays} inputmode="numeric" hint={t('property.paymentDaysHint')} error={errors.paymentDays} />
+            <Btn {busy} onclick={() => { if (readingDay.trim() && !/^([1-9]|[12]\d|3[01])$/.test(readingDay.trim())) { errors.readingDay = 'Число от 1 до 31 (29–31 — последний день месяца)'; return; } errors.readingDay = ''; if (!/^([1-9]|[1-8]\d|90)$/.test(paymentDays.trim())) { errors.paymentDays = 'Число от 1 до 90'; return; } errors.paymentDays = ''; void patch({ name, tenant_name: tenant, reading_day: readingDay.trim() ? Number(readingDay) : 0, payment_days: Number(paymentDays) }); }}>{t('save')}</Btn>
           </Card>
         {/if}
 
         <Card>
-          <p class="text-sm">{p.reading_day ? t('property.readingDayShow', { day: p.reading_day }) : t('property.readingDayNone')}</p>
+          <p class="text-sm">{p.payment_days ? t('property.paymentDaysShow', { days: p.payment_days }) + ' · ' : ''}{p.reading_day ? (p.reading_day > 28 ? t('property.readingDayLast') : t('property.readingDayShow', { day: p.reading_day })) : t('property.readingDayNone')}</p>
         </Card>
 
         <Card>

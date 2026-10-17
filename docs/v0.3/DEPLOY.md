@@ -88,3 +88,11 @@ git rev-parse HEAD > /var/backups/rentflow/previous_release   # коммит, н
 он игнорирует `membership`. **После регистрации новых владельцев предыдущий образ их не знает** (считает «незнакомцами» и
 показывает им первый объект) — в этом случае откат только вариантом B (восстановление снимка) с потерей данных после снимка.
 Поэтому первые сутки после релиза не приглашайте новых владельцев.
+
+## Milestone 4 — migration 0010 and behaviour changes
+
+- Migration `0010_recurring.sql` is additive (`reading_last`, `payment_days`, `bill.due_date`, `notification_log`); no data is rewritten. Existing approved bills get `due_date` NULL (no overdue).
+- Reminders: tenant at the due day and +2 days, owner when readings are still missing; reading day 29–31 means the last day of the month; time is evaluated in the property's own timezone.
+- Payment deadline: set per property (`payment_days`), `due_date` is fixed at approval; overdue is computed in the property timezone and also triggers a reminder.
+- Delivery failures are logged in `notification_log` (safe reason codes only, no message text); more than 5 in 24h alerts `ADMIN_TELEGRAM_ID` ("notify").
+- Rollback: the image can be rolled back (new tables/columns are ignored by old code); no restore needed.

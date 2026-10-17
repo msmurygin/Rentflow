@@ -1742,18 +1742,22 @@ async fn schedule_command_validates_and_is_landlord_only() {
     let now = at(2026, 10, 15);
     for bad in [
         "/schedule 0",
-        "/schedule 29",
+        "/schedule 32",
         "/schedule abc",
         "/schedule -3",
     ] {
         let r = h.say(LANDLORD, bad, now).await;
-        assert!(
-            r[0].text.contains("1 до 28") || r[0].text.contains("число"),
-            "{bad}: {r:?}"
-        );
+        assert!(r[0].text.contains("число"), "{bad}: {r:?}");
     }
     let r = h.say(LANDLORD, "/schedule", now).await;
     assert!(r[0].text.contains("не задано"), "{r:?}");
+    // 29–31 — это «последний день месяца»; правило показывается явно
+    for ok in ["/schedule 29", "/schedule 30", "/schedule 31"] {
+        let r = h.say(LANDLORD, ok, now).await;
+        assert!(r[0].text.contains("последний день"), "{ok}: {r:?}");
+    }
+    assert_eq!(h.count("SELECT reading_last FROM property").await, 1);
+    assert_eq!(h.count("SELECT count(reading_day) FROM property").await, 0);
     h.say(LANDLORD, "/schedule 25", now).await;
     let r = h.say(LANDLORD, "/schedule", now).await;
     assert!(r[0].text.contains("25-го"), "{r:?}");
@@ -1761,42 +1765,94 @@ async fn schedule_command_validates_and_is_landlord_only() {
     h.say(TENANT, "/schedule 5", now).await;
     let day: i64 = h.count("SELECT reading_day FROM property").await;
     assert_eq!(day, 25);
+    assert_eq!(
+        h.count("SELECT reading_last FROM property").await,
+        0,
+        "число 25 снимает режим «последний день»"
+    );
     h.say(LANDLORD, "/schedule off", now).await;
     assert_eq!(h.count("SELECT count(reading_day) FROM property").await, 0);
+    assert_eq!(h.count("SELECT reading_last FROM property").await, 0);
+}
+
+/// Бот хранит время квартиры как UTC + сдвиг; у тестовых квартир сдвиг +3 (Москва).
+fn utc(local: NaiveDateTime) -> NaiveDateTime {
+    local - chrono::Duration::hours(3)
 }
 
 #[tokio::test]
-async fn reminders_come_before_on_and_after_the_deadline_once_each() {
+async fn reminders_come_on_the_day_and_two_days_later_once_each() {
     let h = october_ready_with_schedule("25").await;
     let quiet = |r: &[Reply]| assert!(r.is_empty(), "{r:?}");
-    quiet(&h.app.due_reminders(at(2026, 10, 23)).await.unwrap());
-    quiet(&h.app.due_reminders(at_h(2026, 10, 24, 9)).await.unwrap()); // раньше 10:00 не шлём
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 24))).await.unwrap()); // накануне — тишина
+    quiet(
+        &h.app
+            .due_reminders(utc(at_h(2026, 10, 25, 9)))
+            .await
+            .unwrap(),
+    ); // до 10:00 по времени квартиры
 
-    let r = h.app.due_reminders(at_h(2026, 10, 24, 10)).await.unwrap();
+    let r = h
+        .app
+        .due_reminders(utc(at_h(2026, 10, 25, 10)))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].chat_id, TENANT * 100);
-    assert!(r[0].text.contains("Завтра (25.10)"), "{r:?}");
-    assert!(buttons(&r).contains(&"enter".to_string()));
-    quiet(&h.app.due_reminders(at_h(2026, 10, 24, 15)).await.unwrap()); // повтор в тот же день — тишина
-
-    let r = h.app.due_reminders(at(2026, 10, 25)).await.unwrap();
     assert!(r[0].text.contains("Сегодня (25.10)"), "{r:?}");
-    let r = h.app.due_reminders(at(2026, 10, 26)).await.unwrap();
-    assert!(
-        r[0].text.contains("просрочены") && r[0].text.contains("1 дн."),
-        "{r:?}"
-    );
-    let r = h.app.due_reminders(at(2026, 10, 28)).await.unwrap();
+    assert!(buttons(&r).contains(&"enter".to_string()));
+    quiet(
+        &h.app
+            .due_reminders(utc(at_h(2026, 10, 25, 18)))
+            .await
+            .unwrap(),
+    ); // повтор в тот же день — тишина
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 26))).await.unwrap()); // на следующий день — не спамим
+
+    let r = h.app.due_reminders(utc(at(2026, 10, 27))).await.unwrap();
     assert_eq!(r.len(), 2, "{r:?}");
     assert!(
         r.iter()
-            .any(|x| x.chat_id == TENANT * 100 && x.text.contains("3 дн."))
+            .any(|x| x.chat_id == TENANT * 100 && x.text.contains("ещё не получены"))
     );
     assert!(
         r.iter()
             .any(|x| x.chat_id == LANDLORD * 100 && x.text.contains("не передал"))
     );
-    quiet(&h.app.due_reminders(at(2026, 10, 29)).await.unwrap()); // всё уже отправлено
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 27))).await.unwrap());
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 28))).await.unwrap()); // дальше — тишина
+}
+
+#[tokio::test]
+async fn the_property_timezone_decides_when_the_day_starts() {
+    let h = october_ready_with_schedule("25").await;
+    // квартира в UTC+8: 25 октября 10:00 у неё — это 02:00 UTC
+    sqlx::query("UPDATE property SET tz_offset_hours = 8")
+        .execute(h.app.pool())
+        .await
+        .unwrap();
+    let utc_2am = at_h(2026, 10, 25, 2);
+    let r = h.app.due_reminders(utc_2am).await.unwrap();
+    assert_eq!(r.len(), 1, "в Иркутске уже 10:00 25-го: {r:?}");
+    // а для Москвы (UTC+3) в этот же момент 05:00 — рано
+    let h2 = october_ready_with_schedule("25").await;
+    assert!(h2.app.due_reminders(utc_2am).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schedule_29_to_31_falls_on_the_last_day_of_the_month() {
+    let h = october_ready_with_schedule("31").await;
+    // в ноябре 30 дней: срок — 30 ноября
+    assert!(
+        h.app
+            .due_reminders(utc(at(2026, 11, 29)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let r = h.app.due_reminders(utc(at(2026, 11, 30))).await.unwrap();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].text.contains("30.11"), "{r:?}");
 }
 
 #[tokio::test]
@@ -1846,4 +1902,99 @@ async fn paid_bill_cannot_be_voided_by_default() {
     let r = h.tap(LANDLORD, &format!("vo:{id}"), now).await;
     assert!(r[0].text.contains("оплачен"), "{r:?}");
     assert_eq!(h.status_of("2026-10").await, ["paid"]);
+}
+
+// ---------- срок оплаты и просрочка ----------
+
+#[tokio::test]
+async fn approval_sets_the_payment_deadline_from_the_property_term() {
+    let (h, id) = H::approved_october().await;
+    let due: String = sqlx::query_scalar("SELECT due_date FROM bill WHERE id = ?")
+        .bind(id)
+        .fetch_one(h.app.pool())
+        .await
+        .unwrap();
+    assert_eq!(due, "2026-10-27", "17 октября + 10 дней по умолчанию");
+    // свой срок у квартиры: 14 дней
+    let (h2, _) = H::october().await;
+    sqlx::query("UPDATE property SET payment_days = 14")
+        .execute(h2.app.pool())
+        .await
+        .unwrap();
+    let draft: i64 = h2.count("SELECT id FROM bill WHERE status = 'draft'").await;
+    h2.tap(LANDLORD, &format!("ap:{draft}"), at(2026, 10, 17))
+        .await;
+    let due: String = sqlx::query_scalar("SELECT due_date FROM bill WHERE id = ?")
+        .bind(draft)
+        .fetch_one(h2.app.pool())
+        .await
+        .unwrap();
+    assert_eq!(due, "2026-10-31");
+}
+
+#[tokio::test]
+async fn payment_reminders_come_on_the_due_day_and_two_days_after_once_each() {
+    let (h, id) = H::approved_october().await; // срок 27.10
+    let quiet = |r: &[Reply]| assert!(r.is_empty(), "{r:?}");
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 26))).await.unwrap());
+    quiet(
+        &h.app
+            .due_reminders(utc(at_h(2026, 10, 27, 9)))
+            .await
+            .unwrap(),
+    );
+    let r = h
+        .app
+        .due_reminders(utc(at_h(2026, 10, 27, 10)))
+        .await
+        .unwrap();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].chat_id, TENANT * 100);
+    assert!(
+        r[0].text.contains("срок оплаты") && r[0].text.contains("2063,61"),
+        "{r:?}"
+    );
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 27))).await.unwrap());
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 28))).await.unwrap());
+    let r = h.app.due_reminders(utc(at(2026, 10, 29))).await.unwrap();
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert!(
+        r.iter()
+            .any(|x| x.chat_id == TENANT * 100 && x.text.contains("прошёл"))
+    );
+    assert!(
+        r.iter()
+            .any(|x| x.chat_id == LANDLORD * 100 && x.text.contains("не оплачен"))
+    );
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 29))).await.unwrap());
+    // оплачено владельцем — больше ничего (в том числе после срока)
+    h.tap(LANDLORD, &format!("pd:{id}"), at(2026, 10, 30)).await;
+    quiet(&h.app.due_reminders(utc(at(2026, 10, 31))).await.unwrap());
+}
+
+#[tokio::test]
+async fn paid_bills_and_bills_without_a_deadline_never_trigger_payment_reminders() {
+    let (h, id) = H::approved_october().await;
+    h.tap(LANDLORD, &format!("pd:{id}"), at(2026, 10, 18)).await;
+    assert!(
+        h.app
+            .due_reminders(utc(at(2026, 10, 27)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // счёт, утверждённый до появления сроков (due_date пуст), — без неожиданных уведомлений
+    let (h2, id2) = H::approved_october().await;
+    sqlx::query("UPDATE bill SET due_date = NULL WHERE id = ?")
+        .bind(id2)
+        .execute(h2.app.pool())
+        .await
+        .unwrap();
+    assert!(
+        h2.app
+            .due_reminders(utc(at(2026, 10, 29)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

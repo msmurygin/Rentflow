@@ -80,10 +80,10 @@
       <Card>
         <div class="flex items-center justify-between">
           <h1 class="text-lg font-semibold">{monthName(b.period)}</h1>
-          <Badge status={b.status} />
+          <Badge status={b.status} overdue={b.overdue} />
         </div>
         <div class="num mt-2 text-4xl font-bold tracking-tight">{money(b.total)}</div>
-        {#if b.paid_at}<p class="mt-1 text-sm text-muted">{dateLong(b.paid_at)}</p>{/if}
+        {#if b.paid_at}<p class="mt-1 text-sm text-muted">{dateLong(b.paid_at)}</p>{:else if b.status === 'approved' && b.due_date}<p class="mt-1 text-sm {b.overdue ? 'text-bad' : 'text-muted'}">{t('bills.payBy')} {dateLong(b.due_date)}</p>{/if}
       </Card>
 
       <Card>

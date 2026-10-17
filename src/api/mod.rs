@@ -73,6 +73,17 @@ impl ApiState {
     }
 }
 
+impl ApiState {
+    /// Сегодняшняя дата в часовом поясе квартиры.
+    async fn today(&self, property_id: i64) -> Result<chrono::NaiveDate, ApiError> {
+        let tz: i64 = sqlx::query_scalar("SELECT tz_offset_hours FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(self.app.pool())
+            .await?;
+        Ok(((self.clock)().naive_utc() + Duration::hours(tz)).date())
+    }
+}
+
 type St = State<Arc<ApiState>>;
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -430,7 +441,8 @@ async fn property_json(st: &ApiState, ctx: &Ctx, property_id: i64) -> Result<Val
         "name": name,
         "tenant_name": tenant_name,
         "tenant_connected": tenant_user.is_some(),
-        "reading_day": st.app.reading_day(property_id).await?,
+        "reading_day": st.app.reading_rule(property_id).await?.map(|r| r.api_day()),
+        "payment_days": sqlx::query_scalar::<_, i64>("SELECT payment_days FROM property WHERE id = ?").bind(property_id).fetch_one(st.app.pool()).await?,
         "registers": registers,
     });
     if matches!(ctx.role, Role::Landlord(_)) {
@@ -461,6 +473,8 @@ struct PropertyBody {
     proof_required: Option<bool>,
     /// День месяца 1–28, до которого арендатор передаёт показания; 0 — снять расписание.
     reading_day: Option<i64>,
+    /// Сколько дней на оплату после утверждения счёта (1–90).
+    payment_days: Option<i64>,
     /// Отключённые регистры (`t2`, `hot` …): по ним не нужны ни показания, ни тарифы.
     disabled: Option<Vec<String>>,
     /// Часовой пояс объекта: сдвиг от UTC в часах (−12…14).
@@ -516,6 +530,20 @@ async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<
                     .to_string(),
             ),
         };
+        // всё, что может быть отвергнуто, проверяется ДО создания: отказ не должен оставлять полусозданную квартиру
+        if let Some(d) = b.reading_day
+            && d != 0
+            && crate::reminders::ReadingRule::from_input(d).is_none()
+        {
+            return bad(
+                "День передачи показаний — число от 1 до 31 (29–31 — последний день месяца).",
+            );
+        }
+        if let Some(days) = b.payment_days
+            && !(1..=90).contains(&days)
+        {
+            return bad("Срок оплаты — от 1 до 90 дней.");
+        }
         let disabled: Vec<String> = b.disabled.clone().unwrap_or_default();
         if disabled
             .iter()
@@ -560,6 +588,11 @@ async fn create_from_body(st: &ApiState, ctx: &Ctx, b: &PropertyBody) -> Result<
         let id = st.app.create_property(landlord.id, &np, now).await?;
         if let Some(proof) = b.proof_required {
             set_proof(st, id, proof).await?;
+        }
+        // расписание и срок оплаты из мастера применяются при создании (а не только при последующей правке)
+        set_schedule(st, id, b.reading_day).await?;
+        if let Some(days) = b.payment_days {
+            st.app.set_payment_days(id, days).await?;
         }
         st.audit(
             ctx,
@@ -629,6 +662,9 @@ async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> A
                 set_proof(&st, id, proof).await?;
             }
             set_schedule(&st, id, b.reading_day).await?;
+            if let Some(days) = b.payment_days {
+                st.app.set_payment_days(id, days).await?;
+            }
             st.audit(&ctx, "property_update", "property", Some(id.to_string()), json!({ "name": b.name, "tenant_name": b.tenant_name, "proof_required": b.proof_required, "reading_day": b.reading_day })).await;
             id
         }
@@ -641,7 +677,6 @@ async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> A
 async fn set_schedule(st: &ApiState, property_id: i64, day: Option<i64>) -> Result<(), ApiError> {
     match day {
         None => Ok(()),
-        Some(0) => Ok(st.app.set_reading_day(property_id, None).await?),
         Some(d) => Ok(st.app.set_reading_day(property_id, Some(d)).await?),
     }
 }
@@ -701,21 +736,21 @@ async fn home(State(st): St, ctx: Ctx) -> ApiResult {
         .await?;
     let billed = st.app.period_billed(property_id, &period).await?;
     // срок передачи показаний: по расписанию владельца, а без него — первое число следующего месяца
-    let reading_day = st.app.reading_day(property_id).await?;
+    let rule = st.app.reading_rule(property_id).await?;
     let (first, _) = period_bounds(&period).ok_or(ApiError::Internal)?;
     let next_month = period_of(first + Duration::days(32));
-    let next_due = if billed {
-        Some(format!("{next_month}-{:02}", reading_day.unwrap_or(1)))
+    let target = if billed {
+        next_month.clone()
     } else {
-        None
+        period.clone()
     };
-    let due_date = reading_day.map(|d| {
-        if billed {
-            format!("{next_month}-{d:02}")
-        } else {
-            format!("{period}-{d:02}")
-        }
+    let due_date = rule.and_then(|r| r.due(&target)).map(|d| d.to_string());
+    let next_due = billed.then(|| {
+        due_date
+            .clone()
+            .unwrap_or_else(|| format!("{next_month}-01"))
     });
+    let reading_day = rule.map(|r| r.api_day());
     Ok(Json(json!({
         "role": ctx.role_name(),
         "property": { "name": name, "tenant_name": tenant_name, "tenant_connected": tenant_user.is_some() },
@@ -970,6 +1005,7 @@ struct BillRow {
     created_at: String,
     decided_at: Option<String>,
     paid_at: Option<String>,
+    due_date: Option<String>,
 }
 
 type BillTuple = (
@@ -983,9 +1019,10 @@ type BillTuple = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
-const BILL_COLS: &str = "b.id, b.property_id, b.period, b.version, b.status, b.total, b.snapshot, b.created_at, b.decided_at, b.paid_at";
+const BILL_COLS: &str = "b.id, b.property_id, b.period, b.version, b.status, b.total, b.snapshot, b.created_at, b.decided_at, b.paid_at, b.due_date";
 
 impl From<BillTuple> for BillRow {
     fn from(t: BillTuple) -> Self {
@@ -1000,13 +1037,21 @@ impl From<BillTuple> for BillRow {
             created_at: t.7,
             decided_at: t.8,
             paid_at: t.9,
+            due_date: t.10,
         }
     }
 }
 
-fn bill_summary(b: &BillRow) -> Value {
+/// `today` — сегодняшняя дата В ЧАСОВОМ ПОЯСЕ КВАРТИРЫ: от неё зависит, просрочен ли счёт.
+fn bill_summary(b: &BillRow, today: chrono::NaiveDate) -> Value {
+    let overdue = b.status == "approved"
+        && b.due_date
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .is_some_and(|d| d < today);
     json!({ "id": b.id, "period": b.period, "version": b.version, "status": b.status, "total": b.total,
-            "created_at": b.created_at, "decided_at": b.decided_at, "paid_at": b.paid_at })
+            "created_at": b.created_at, "decided_at": b.decided_at, "paid_at": b.paid_at,
+            "due_date": b.due_date, "overdue": overdue })
 }
 
 /// Счёт и роль пользователя в ЕГО объекте. Доступ определяется объектом счёта, а не «текущим» объектом запроса:
@@ -1065,9 +1110,36 @@ async fn bills_list(State(st): St, ctx: Ctx) -> ApiResult {
         .bind(property_id)
         .fetch_all(st.app.pool())
         .await?;
+    let today = st.today(property_id).await?;
     Ok(Json(
-        json!({ "bills": rows.into_iter().map(|t| bill_summary(&BillRow::from(t))).collect::<Vec<_>>() }),
+        json!({ "bills": rows.into_iter().map(|t| bill_summary(&BillRow::from(t), today)).collect::<Vec<_>>() }),
     ))
+}
+
+/// История расхода и счетов по квартире: по месяцам, по каждой услуге — расход и сумма (из неизменяемых снимков счетов).
+async fn history(State(st): St, ctx: Ctx) -> ApiResult {
+    let Some(property_id) = st.property_of(&ctx).await? else {
+        return Ok(Json(json!({ "months": [] })));
+    };
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, period, status, total, snapshot FROM bill
+          WHERE property_id = ? AND status IN ('approved', 'paid') ORDER BY period DESC, id DESC LIMIT 24",
+    )
+    .bind(property_id)
+    .fetch_all(st.app.pool())
+    .await?;
+    let months: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, period, status, total, snapshot)| {
+            let snap: Value = serde_json::from_str(&snapshot).unwrap_or(Value::Null);
+            let lines: Vec<Value> = snap["lines"]
+                .as_array()
+                .map(|l| l.iter().map(|x| json!({ "code": x["code"], "usage": x["usage"], "amount": x["amount"] })).collect())
+                .unwrap_or_default();
+            json!({ "bill_id": id, "period": period, "status": status, "total": total, "lines": lines })
+        })
+        .collect();
+    Ok(Json(json!({ "months": months })))
 }
 
 async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
@@ -1082,7 +1154,7 @@ async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
     .fetch_all(st.app.pool())
     .await?;
     let landlord = bill_role == MRole::Owner;
-    let mut v = bill_summary(&b);
+    let mut v = bill_summary(&b, st.today(b.property_id).await?);
     v["snapshot"] = snapshot;
     v["readings"] = json!(readings.iter().map(|(id, code, value, read_on, photo)| json!({ "reading_id": id, "code": code, "value": value, "read_on": read_on, "has_photo": photo })).collect::<Vec<_>>());
     v["can_approve"] = json!(landlord && b.status == "draft");
@@ -1125,7 +1197,10 @@ async fn decide(st: &ApiState, ctx: &Ctx, id: i64, action: &str, target: &str) -
     )
     .await;
     st.notify_others(ctx, replies).await;
-    Ok(Json(bill_summary(&after)))
+    Ok(Json(bill_summary(
+        &after,
+        st.today(after.property_id).await?,
+    )))
 }
 
 async fn bill_approve(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
@@ -1165,7 +1240,10 @@ async fn bill_void(
         .await?;
     let after = bill_for(&st, &ctx, id).await?;
     st.notify_others(&ctx, replies).await;
-    Ok(Json(bill_summary(&after)))
+    Ok(Json(bill_summary(
+        &after,
+        st.today(after.property_id).await?,
+    )))
 }
 
 async fn bill_reissue(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult {
@@ -1376,6 +1454,7 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/readings/submit", post(submit))
         .route("/tariffs", get(tariffs_get).put(tariffs_put))
         .route("/bills", get(bills_list))
+        .route("/history", get(history))
         .route("/bills/{id}", get(bill_detail))
         .route("/bills/{id}/approve", post(bill_approve))
         .route("/bills/{id}/reject", post(bill_reject))

@@ -42,7 +42,9 @@ pub async fn run(bot: Bot, app: Arc<App>, tz_offset_hours: i64) {
         .await;
 }
 
-pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
+/// Отправляет ответы и возвращает неудачи: (чат, безопасный код причины). Остальные ответы уходят независимо от сбоев.
+pub async fn send_all_report(bot: &Bot, replies: Vec<Reply>) -> Vec<(i64, &'static str)> {
+    let mut failed = vec![];
     for r in replies {
         for (file_id, caption) in &r.photos {
             // `local:<путь>` — фото из Mini App: у Telegram file_id нет, отправляем файл с диска
@@ -62,6 +64,7 @@ pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
                 .await;
             if let Err(e) = sent {
                 tracing::warn!(chat = r.chat_id, error = %e, "send_photo failed");
+                failed.push((r.chat_id, classify(&e)));
             }
         }
         let mut req = bot.send_message(ChatId(r.chat_id), r.text);
@@ -80,7 +83,36 @@ pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
         if let Err(e) = req.await {
             // например, пользователь заблокировал бота: остальные ответы всё равно отправляем
             tracing::warn!(chat = r.chat_id, error = %e, "send_message failed");
+            failed.push((r.chat_id, classify(&e)));
         }
+    }
+    failed
+}
+
+pub async fn send_all(bot: &Bot, replies: Vec<Reply>) {
+    send_all_report(bot, replies).await;
+}
+
+/// Как `send_all`, но каждая неудача пишется в журнал доставки (без текста сообщения) — по нему видно,
+/// кому не дошло и почему (бот заблокирован, чат не найден, сеть).
+pub async fn send_logged(bot: &Bot, app: &App, kind: &str, replies: Vec<Reply>) {
+    let now = Utc::now().naive_utc();
+    for (chat, reason) in send_all_report(bot, replies).await {
+        app.record_failed_delivery(now, chat, kind, reason).await;
+    }
+}
+
+/// Безопасный код причины сбоя доставки: без текста ошибки и персональных данных.
+pub fn classify(e: &teloxide::RequestError) -> &'static str {
+    use teloxide::{ApiError, RequestError};
+    match e {
+        RequestError::Api(ApiError::BotBlocked) => "bot_blocked",
+        RequestError::Api(ApiError::ChatNotFound) => "chat_not_found",
+        RequestError::Api(ApiError::UserDeactivated) => "user_deactivated",
+        RequestError::Api(_) => "telegram_api_error",
+        RequestError::RetryAfter(_) => "rate_limited",
+        RequestError::Network(_) => "network",
+        _ => "other",
     }
 }
 
@@ -185,4 +217,30 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> ResponseResult<()>
         .await;
     send_all(&bot, replies).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teloxide::{ApiError, RequestError};
+
+    #[test]
+    fn delivery_failures_get_stable_safe_codes() {
+        assert_eq!(
+            classify(&RequestError::Api(ApiError::BotBlocked)),
+            "bot_blocked"
+        );
+        assert_eq!(
+            classify(&RequestError::Api(ApiError::ChatNotFound)),
+            "chat_not_found"
+        );
+        assert_eq!(
+            classify(&RequestError::Api(ApiError::UserDeactivated)),
+            "user_deactivated"
+        );
+        assert_eq!(
+            classify(&RequestError::Api(ApiError::MessageTextIsEmpty)),
+            "telegram_api_error"
+        );
+    }
 }

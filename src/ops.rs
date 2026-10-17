@@ -13,6 +13,8 @@ pub struct Vitals {
     pub backup_age_hours: Option<i64>,
     pub offsite_age_hours: Option<i64>,
     pub offsite_expected: bool,
+    /// Недоставленные уведомления за сутки (бот заблокирован, чат не найден, сеть).
+    pub failed_deliveries_24h: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -25,6 +27,7 @@ pub struct Alert {
 pub const TELEGRAM_STALE_SECS: i64 = 300;
 pub const DISK_MIN_MB: u64 = 500;
 pub const BACKUP_MAX_AGE_H: i64 = 36;
+pub const FAILED_DELIVERIES_MAX: i64 = 5;
 
 pub fn evaluate(v: &Vitals) -> Vec<Alert> {
     let mut out = vec![];
@@ -60,6 +63,15 @@ pub fn evaluate(v: &Vitals) -> Vec<Alert> {
             "Копия не выгружена за пределы сервера более 36 часов.".into(),
         );
     }
+    if v.failed_deliveries_24h > FAILED_DELIVERIES_MAX {
+        push(
+            "notify",
+            format!(
+                "Не доставлено уведомлений за сутки: {} (подробности в notification_log).",
+                v.failed_deliveries_24h
+            ),
+        );
+    }
     out
 }
 
@@ -75,6 +87,7 @@ mod tests {
             backup_age_hours: Some(5),
             offsite_age_hours: Some(5),
             offsite_expected: true,
+            failed_deliveries_24h: 0,
         }
     }
 

@@ -629,6 +629,28 @@ impl App {
         self.cfg.admin_telegram_id
     }
 
+    /// Запись о недоставленном сообщении (только чат, вид и код причины — без текста).
+    pub async fn record_failed_delivery(
+        &self,
+        now: NaiveDateTime,
+        chat_id: i64,
+        kind: &str,
+        reason: &str,
+    ) {
+        let r = sqlx::query(
+            "INSERT INTO notification_log (at, chat_id, kind, ok, error) VALUES (?, ?, ?, 0, ?)",
+        )
+        .bind(now_iso(now))
+        .bind(chat_id)
+        .bind(kind)
+        .bind(reason)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = r {
+            tracing::error!(error = %e, "notification_log write failed");
+        }
+    }
+
     pub fn note_telegram_ok(&self, unix: i64) {
         self.telegram_ok_at
             .store(unix, std::sync::atomic::Ordering::Relaxed);
@@ -659,6 +681,13 @@ impl App {
                 .as_ref()
                 .and_then(|d| crate::backup::mark_age_hours(&d.join("last_offsite.json"), now)),
             offsite_expected: self.cfg.offsite_expected,
+            failed_deliveries_24h: sqlx::query_scalar(
+                "SELECT count(*) FROM notification_log WHERE ok = 0 AND at >= ?",
+            )
+            .bind(now_iso(now - chrono::Duration::hours(24)))
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0),
         }
     }
 }
