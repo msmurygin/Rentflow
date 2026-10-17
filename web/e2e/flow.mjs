@@ -154,7 +154,7 @@ await shot(dark, 'owner-tariffs-dark');
 const plain = await browser.newPage({ viewport: { width: 390, height: 844 } });
 await plain.route('https://telegram.org/**', (r) => r.abort());
 await plain.goto(BASE);
-await plain.getByText('Откройте RentFlow из Telegram.').waitFor();
+await plain.getByText(/Не загрузился скрипт Telegram/).waitFor();
 check(true, 'вне Telegram показывается подсказка');
 
 await browser.close();

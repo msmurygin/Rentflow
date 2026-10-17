@@ -83,7 +83,7 @@
     <div class="grid h-[70vh] place-content-center gap-4 text-center">
       <div class="text-2xl font-bold">{t('appName')}</div>
       <p class="max-w-xs text-muted">
-        {boot === 'closed' ? t('openInTelegram') : boot === 'denied' ? t('notConnected') : t('offline')}
+        {boot === 'closed' ? (tg.scriptLoaded ? t('openFromMenu') : t('scriptBlocked')) : boot === 'denied' ? t('notConnected') : t('offline')}
       </p>
       {#if boot === 'error'}<Btn variant="secondary" onclick={start}>{t('retry')}</Btn>{/if}
     </div>

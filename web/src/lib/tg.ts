@@ -18,6 +18,10 @@ interface WebApp {
 const wa = (): WebApp | undefined => (window as unknown as { Telegram?: { WebApp?: WebApp } }).Telegram?.WebApp;
 
 export const tg = {
+  /** Скрипт Telegram вообще загрузился (а не заблокирован сетью/прокси). */
+  get scriptLoaded() {
+    return !!wa();
+  },
   get available() {
     return !!wa()?.initData;
   },
