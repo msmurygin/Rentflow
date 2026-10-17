@@ -449,20 +449,15 @@ mod lock_order_tests {
         let ten = id(&pool, "INSERT INTO tenancy (property_id, tenant_id, starts_on) VALUES ($1, $2, '2026-01-01') RETURNING id", &[prop, tenant]).await;
         let period = id(&pool, "INSERT INTO billing_period (tenancy_id, starts_on, ends_on) VALUES ($1, '2026-09-01', '2026-09-30') RETURNING id", &[ten]).await;
         let meter = id(&pool, "INSERT INTO meter (property_id, kind, label, unit) VALUES ($1, 'cold_water', 'cold', 'm3') RETURNING id", &[prop]).await;
+        let register = id(&pool, "INSERT INTO meter_register (meter_id, register_code, display_label, unit) VALUES ($1, 'main', 'cold', 'm3') RETURNING id", &[meter]).await;
         for (v, at) in [
             ("120", "2026-08-31T10:00:00Z"),
             ("125", "2026-09-30T10:00:00Z"),
         ] {
-            sqlx::query("INSERT INTO meter_reading (meter_id, value, read_at, source, status, confirmed_by) VALUES ($1, $2::numeric, $3::timestamptz, 'manual', 'confirmed', $4)")
-                .bind(meter).bind(v).bind(at).bind(owner).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO meter_reading (meter_register_id, value, read_at, source, status, confirmed_by) VALUES ($1, $2::numeric, $3::timestamptz, 'manual', 'confirmed', $4)")
+                .bind(register).bind(v).bind(at).bind(owner).execute(&pool).await.unwrap();
         }
-        sqlx::query(
-            "INSERT INTO tariff (meter_id, unit_price, valid_from) VALUES ($1, 65, '2026-01-01')",
-        )
-        .bind(meter)
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO tariff (meter_register_id, unit_price, valid_from) VALUES ($1, 65, '2026-01-01')").bind(register).execute(&pool).await.unwrap();
 
         for _ in 0..100 {
             let mut tasks = Vec::new();

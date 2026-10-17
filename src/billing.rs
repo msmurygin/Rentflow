@@ -118,12 +118,13 @@ pub fn calculate_with(
     }
     let mut lines = Vec::with_capacity(inputs.len() + 1);
     for m in inputs {
-        let previous_raw = m
-            .previous
-            .ok_or_else(|| BillingError::MissingPrevious(m.meter_id.clone()))?;
+        // Если нет обоих показаний, действенно сообщить про текущее: его ждём от арендатора.
         let current_raw = m
             .current
             .ok_or_else(|| BillingError::MissingCurrent(m.meter_id.clone()))?;
+        let previous_raw = m
+            .previous
+            .ok_or_else(|| BillingError::MissingPrevious(m.meter_id.clone()))?;
         let tariff = m
             .tariff
             .ok_or_else(|| BillingError::MissingTariff(m.meter_id.clone()))?;
