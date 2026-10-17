@@ -205,6 +205,8 @@ cd web && npm run dev                              # Vite с горячей пе
    Миграции базы применяются при старте (0006 добавляет `api_session` и `audit_log`).
 5. Проверка: `curl -fsS https://<домен>/healthz` → `ok`, затем открыть бота → кнопка меню.
 
+Скрипт Telegram (`web/public/telegram-web-app.js`) отдаётся с вашего домена, а не с telegram.org: в корпоративных сетях `telegram.org` бывает заблокирован. Обновить копию: `curl -fsS https://telegram.org/js/telegram-web-app.js -o web/public/telegram-web-app.js`.
+
 Приглашение арендатора по-прежнему идёт ссылкой `t.me/<бот>?start=…`; после принятия арендатор открывает приложение кнопкой меню.
 
 ## 10. Тесты

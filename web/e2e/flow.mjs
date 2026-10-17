@@ -17,7 +17,7 @@ async function openAs(userId, scheme = 'light') {
   const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: scheme });
   const initData = await (await fetch(`${BASE}/dev/init?user=${userId}`)).text();
   // настоящий telegram-web-app.js вне Telegram затёр бы заглушку — не даём ему загрузиться
-  await ctx.route('https://telegram.org/**', (r) => r.abort());
+  await ctx.route('**/telegram-web-app.js', (r) => r.abort());
   await ctx.addInitScript(({ initData, scheme }) => {
     window.__back = [];
     window.Telegram = { WebApp: { initData, colorScheme: scheme, ready() {}, expand() {}, close() {}, onEvent() {}, setHeaderColor() {}, setBackgroundColor() {}, disableVerticalSwipes() {},
@@ -152,7 +152,7 @@ await shot(dark, 'owner-tariffs-dark');
 
 // 7. не из Telegram
 const plain = await browser.newPage({ viewport: { width: 390, height: 844 } });
-await plain.route('https://telegram.org/**', (r) => r.abort());
+await plain.route('**/telegram-web-app.js', (r) => r.abort());
 await plain.goto(BASE);
 await plain.getByText(/Не загрузился скрипт Telegram/).waitFor();
 check(true, 'вне Telegram показывается подсказка');
