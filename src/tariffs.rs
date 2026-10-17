@@ -74,6 +74,71 @@ impl App {
         ))
     }
 
+    /// История тарифов по каждой позиции: от новых к старым, с изменением к предыдущему и пометкой «действует».
+    pub(crate) async fn tariff_history(
+        &self,
+        from: &Sender,
+        now: NaiveDateTime,
+    ) -> Res<Vec<Reply>> {
+        let Some(property_id) = self.property_id().await? else {
+            return user_err("Объект не настроен. Начните с /setup");
+        };
+        let sewer_on: bool = sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let today = now.date().to_string();
+        let mut blocks = vec![];
+        for code in CODES {
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT valid_from, price FROM tariff WHERE property_id = ? AND code = ? ORDER BY valid_from DESC")
+                    .bind(property_id)
+                    .bind(code)
+                    .fetch_all(&self.pool)
+                    .await?;
+            let mut lines = vec![format!("{}, ₽ за {}:", label(code), unit(code))];
+            if code == "sewer" && !sewer_on {
+                lines.push("  сейчас арендатор не оплачивает".into());
+            }
+            if rows.is_empty() {
+                lines.push("  тарифов нет".into());
+            }
+            // «действует» — самый свежий тариф, начавшийся не позже сегодняшнего дня
+            let current = rows.iter().position(|(from, _)| *from <= today);
+            for (i, (valid_from, price)) in rows.iter().enumerate() {
+                let price: Decimal = price.parse().unwrap_or_default();
+                let change = match rows.get(i + 1).and_then(|(_, p)| p.parse::<Decimal>().ok()) {
+                    Some(prev) if price != prev => {
+                        let d = price - prev;
+                        format!(
+                            " ({}{})",
+                            if d.is_sign_positive() { "+" } else { "−" },
+                            money(d.abs())
+                        )
+                    }
+                    _ => String::new(),
+                };
+                let mark = if Some(i) == current {
+                    " — действует"
+                } else if *valid_from > today {
+                    " — ещё не вступил в силу"
+                } else {
+                    ""
+                };
+                lines.push(format!("  с {valid_from}: {}{change}{mark}", money(price)));
+            }
+            blocks.push(lines.join("\n"));
+        }
+        Ok(vec![Reply::with_buttons(
+            from.chat_id,
+            format!(
+                "История тарифов\n\n{}\n\nИзменить: /tariff",
+                blocks.join("\n\n")
+            ),
+            vec![vec![("✏️ Изменить тарифы", "tnew".into())]],
+        )])
+    }
+
     /// `/tariff` без аргументов: выбор даты начала действия.
     pub(crate) async fn tariff_start(&self, from: &Sender, now: NaiveDateTime) -> Res<Vec<Reply>> {
         self.set_state(
@@ -95,7 +160,10 @@ impl App {
             vec![
                 vec![(&*format!("С {next_month}"), format!("td:{next_month}"))],
                 vec![(&*format!("С {this_month}"), format!("td:{this_month}"))],
-                vec![("🗑 Отмена", "tx".into())],
+                vec![
+                    ("📜 История тарифов", "th".into()),
+                    ("🗑 Отмена", "tx".into()),
+                ],
             ],
         )])
     }

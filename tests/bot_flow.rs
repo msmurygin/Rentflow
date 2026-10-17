@@ -1100,3 +1100,65 @@ async fn stale_buttons_from_the_old_card_flow_explain_what_to_do() {
         "{r:?}"
     );
 }
+
+// ---------- история тарифов ----------
+
+#[tokio::test]
+async fn tariff_history_lists_versions_newest_first_with_change_and_current_mark() {
+    let h = H::ready().await;
+    let now = at(2026, 9, 10);
+    for cmd in [
+        "/tariff cold 66,87 2026-08-01",
+        "/tariff cold 68 2026-10-01",
+        "/tariff sewer 52,48 2026-08-01",
+    ] {
+        h.say(LANDLORD, cmd, now).await;
+    }
+    let r = h.say(LANDLORD, "/tariffs", now).await;
+    let text = all_text(&r);
+    // ХВС: 68 (будущий), 66,87 (действует), 65,77 (исходный)
+    let cold = text.split("Горячая вода").next().unwrap();
+    let pos_future = cold
+        .find("с 2026-10-01: 68,00 (+1,13) — ещё не вступил в силу")
+        .expect(&text);
+    let pos_now = cold
+        .find("с 2026-08-01: 66,87 (+1,10) — действует")
+        .expect(&text);
+    let pos_old = cold.find("с 2026-01-01: 65,77").expect(&text);
+    assert!(
+        pos_future < pos_now && pos_now < pos_old,
+        "от новых к старым: {text}"
+    );
+    assert!(
+        text.contains("Водоотведение, ₽ за м³:")
+            && text.contains("с 2026-08-01: 52,48 (+0,86) — действует"),
+        "{text}"
+    );
+    assert!(buttons(&r).contains(&"tnew".to_string()));
+}
+
+#[tokio::test]
+async fn tariff_history_is_reachable_from_the_menu_and_hidden_from_the_tenant() {
+    let h = H::ready().await;
+    let now = at(2026, 9, 10);
+    let r = h.say(LANDLORD, "/tariff", now).await;
+    assert!(
+        buttons(&r).contains(&"th".to_string()),
+        "в меню тарифов есть кнопка истории: {r:?}"
+    );
+    let r = h.tap(LANDLORD, "th", now).await;
+    assert!(r[0].text.contains("История тарифов"), "{r:?}");
+    let r = h.say(TENANT, "/tariffs", now).await;
+    assert!(!r[0].text.contains("История тарифов"), "{r:?}");
+}
+
+#[tokio::test]
+async fn tariff_history_shows_sewer_as_off_when_disabled() {
+    let h = H::ready().await;
+    h.say(LANDLORD, "/tariff sewer off", at(2026, 9, 10)).await;
+    let r = h.say(LANDLORD, "/tariffs", at(2026, 9, 10)).await;
+    assert!(
+        r[0].text.contains("сейчас арендатор не оплачивает"),
+        "{r:?}"
+    );
+}

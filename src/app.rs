@@ -315,6 +315,7 @@ impl App {
                 /setup — настроить объект, арендатора, стартовые показания и тарифы\n\
                 /invite — одноразовая ссылка для арендатора\n\
                 /status — показания и счета текущего периода\n\
+                /tariffs — история тарифов по каждой позиции\n\
                 /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
@@ -362,6 +363,7 @@ impl App {
                 "/invite" => self.invite(from, u, now).await,
                 "/status" => self.landlord_status(from, now).await,
                 "/tariff" => self.tariff_cmd(from, u, text, now).await,
+                "/tariffs" => self.tariff_history(from, now).await,
                 "/paid" => self.paid_list(from).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
@@ -398,6 +400,8 @@ impl App {
             (Who::Landlord(_), "ap") => self.bill_approve(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rj") => self.bill_reject(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "pd") => self.bill_paid(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "th") => self.tariff_history(from, now).await,
+            (Who::Landlord(_), "tnew") => self.tariff_start(from, now).await,
             (Who::Landlord(_), "td") => self.tariff_date(from, a.unwrap_or(""), now).await,
             (Who::Landlord(_), "tk") => self.tariff_answer(from, "keep", now).await,
             (Who::Landlord(_), "toff") => self.tariff_answer(from, "off", now).await,
