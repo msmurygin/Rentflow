@@ -75,6 +75,9 @@
     uploading[code] = true;
     errors[code] = '';
     try {
+      // число, уже введённое человеком, сохраняется ДО загрузки фото: подсказка распознавания не должна его перекрыть
+      const typed = (values[code] ?? '').trim();
+      if (typed && isValidNumber(typed)) await commit(code);
       const f = await api.upload<FormView>(`/readings/photo?code=${code}`, await toJpeg(file));
       sync(f);
       await thumb(code);
