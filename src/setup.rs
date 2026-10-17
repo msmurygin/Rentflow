@@ -8,7 +8,6 @@ use rust_decimal::Decimal;
 #[derive(Clone, Copy)]
 enum Kind {
     Text,
-    Date,
     DateOrUnknown,
     Decimal,
     DecimalOrNo,
@@ -50,11 +49,6 @@ const STEPS: &[(&str, &str, Kind)] = &[
         "Стартовое показание электричества T2, кВт·ч:",
         Kind::Decimal,
     ),
-    (
-        "tariff_from",
-        "Дата, с которой действуют эти тарифы (ГГГГ-ММ-ДД). Позже новые тарифы добавляются командой /tariff:",
-        Kind::Date,
-    ),
     ("p_cold", "Тариф ХВС, ₽ за м³:", Kind::Decimal),
     ("p_hot", "Тариф ГВС, ₽ за м³:", Kind::Decimal),
     (
@@ -70,7 +64,6 @@ fn validate(kind: Kind, input: &str) -> Option<String> {
     let t = input.trim();
     match kind {
         Kind::Text => (!t.is_empty() && t.chars().count() <= 100).then(|| t.to_string()),
-        Kind::Date => parse_date(t).map(|d| d.to_string()),
         Kind::DateOrUnknown => {
             if matches!(
                 t.to_lowercase().as_str(),
@@ -167,7 +160,7 @@ impl App {
             .await?;
             return Ok(vec![Reply::text(from.chat_id, prompt)]);
         }
-        let summary = setup_summary(&answers);
+        let summary = setup_summary(&answers, &period_of(now.date()));
         self.set_state(
             from.telegram_id,
             &State::Setup {
@@ -199,6 +192,8 @@ impl App {
             return user_err("Настройка не завершена. Ответьте на оставшиеся вопросы.");
         }
         let ts = now_iso(now);
+        // Тарифы заводятся на текущий расчётный месяц независимо от даты настройки.
+        let month = period_of(now.date());
         let mut tx = self.pool.begin().await?;
         let exists: i64 = sqlx::query_scalar("SELECT count(*) FROM property")
             .fetch_one(&mut *tx)
@@ -206,15 +201,14 @@ impl App {
         if exists > 0 {
             return user_err("Объект уже настроен.");
         }
-        let sewer_on = answer(&answers, "p_sewer") != "no";
-        let property_id = sqlx::query("INSERT INTO property (landlord_id, name, sewer_enabled, created_at) VALUES (?, ?, ?, ?)")
-            .bind(u.id)
-            .bind(answer(&answers, "property"))
-            .bind(sewer_on)
-            .bind(&ts)
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
+        let property_id =
+            sqlx::query("INSERT INTO property (landlord_id, name, created_at) VALUES (?, ?, ?)")
+                .bind(u.id)
+                .bind(answer(&answers, "property"))
+                .bind(&ts)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid();
         sqlx::query("INSERT INTO tenancy (property_id, tenant_name) VALUES (?, ?)")
             .bind(property_id)
             .bind(answer(&answers, "tenant"))
@@ -247,23 +241,21 @@ impl App {
             .bind(&ts)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("INSERT INTO tariff (property_id, code, price, valid_from, created_at) VALUES (?, ?, ?, ?, ?)")
-                .bind(property_id)
-                .bind(code)
-                .bind(answer(&answers, &format!("p_{code}")))
-                .bind(answer(&answers, "tariff_from"))
-                .bind(&ts)
-                .execute(&mut *tx)
-                .await?;
+            insert_tariff(
+                &mut tx,
+                property_id,
+                code,
+                answer(&answers, &format!("p_{code}")),
+                &month,
+                true,
+                &ts,
+            )
+            .await?;
         }
-        if sewer_on {
-            sqlx::query("INSERT INTO tariff (property_id, code, price, valid_from, created_at) VALUES (?, 'sewer', ?, ?, ?)")
-                .bind(property_id)
-                .bind(answer(&answers, "p_sewer"))
-                .bind(answer(&answers, "tariff_from"))
-                .bind(&ts)
-                .execute(&mut *tx)
-                .await?;
+        // Водоотведение: «нет» — выключено с этого месяца (цену не храним), иначе включено с этой ценой.
+        match answer(&answers, "p_sewer") {
+            "no" => insert_tariff(&mut tx, property_id, "sewer", "0", &month, false, &ts).await?,
+            price => insert_tariff(&mut tx, property_id, "sewer", price, &month, true, &ts).await?,
         }
         tx.commit().await?;
         self.clear_state(from.telegram_id).await?;
@@ -411,76 +403,9 @@ impl App {
             ),
         ])
     }
-
-    pub(crate) async fn tariff_cmd(
-        &self,
-        from: &Sender,
-        _u: &UserRow,
-        text: &str,
-        now: NaiveDateTime,
-    ) -> Res<Vec<Reply>> {
-        let Some(property_id) = self.property_id().await? else {
-            return user_err("Сначала настройте объект: /setup");
-        };
-        let args: Vec<&str> = text.split_whitespace().skip(1).collect();
-        if args.is_empty() {
-            return self.tariff_start(from, now).await;
-        }
-        let usage = "Формат: /tariff <код> <цена> <дата начала>, например:\n/tariff cold 66.87 2026-08-01\nКоды: cold, hot, sewer, t1, t2. Водоотведение выключается так: /tariff sewer off";
-        let code = args.first().copied().unwrap_or("");
-        if !matches!(code, "cold" | "hot" | "sewer" | "t1" | "t2") {
-            return user_err(usage);
-        }
-        if code == "sewer" && args.get(1) == Some(&"off") {
-            sqlx::query("UPDATE property SET sewer_enabled = 0 WHERE id = ?")
-                .bind(property_id)
-                .execute(&self.pool)
-                .await?;
-            return Ok(vec![Reply::text(
-                from.chat_id,
-                "Водоотведение выключено: в новых счетах его не будет.",
-            )]);
-        }
-        let (Some(price), Some(date)) = (
-            args.get(1).and_then(|s| parse_decimal(s)),
-            args.get(2).and_then(|s| parse_date(s)),
-        ) else {
-            return user_err(usage);
-        };
-        let ts = now_iso(now);
-        let inserted = sqlx::query("INSERT INTO tariff (property_id, code, price, valid_from, created_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(property_id)
-            .bind(code)
-            .bind(price.to_string())
-            .bind(date.to_string())
-            .bind(&ts)
-            .execute(&self.pool)
-            .await;
-        if let Err(sqlx::Error::Database(e)) = &inserted
-            && e.is_unique_violation()
-        {
-            return user_err("Тариф с такой датой начала уже есть.");
-        }
-        inserted?;
-        if code == "sewer" {
-            sqlx::query("UPDATE property SET sewer_enabled = 1 WHERE id = ?")
-                .bind(property_id)
-                .execute(&self.pool)
-                .await?;
-        }
-        Ok(vec![Reply::text(
-            from.chat_id,
-            format!(
-                "Тариф «{}»: {} ₽ с {}. Уже выставленные счета не меняются.",
-                label(code),
-                money(price),
-                date
-            ),
-        )])
-    }
 }
 
-fn setup_summary(a: &[String]) -> String {
+fn setup_summary(a: &[String], month: &str) -> String {
     let dec = |k: &str| num(answer(a, k).parse::<Decimal>().unwrap_or_default());
     let base_date = match answer(a, "base_date") {
         "unknown" => "дата неизвестна".to_string(),
@@ -491,17 +416,43 @@ fn setup_summary(a: &[String]) -> String {
         _ => format!("{} ₽/м³ (ХВС + ГВС)", dec("p_sewer")),
     };
     format!(
-        "Объект: {}\nАрендатор: {}\n\nСтартовые показания ({base_date}):\n• ХВС: {}\n• ГВС: {}\n• T1: {}\n• T2: {}\n\nТарифы с {}:\n• ХВС: {} ₽/м³\n• ГВС: {} ₽/м³\n• Водоотведение: {sewer}\n• T1: {} ₽/кВт·ч\n• T2: {} ₽/кВт·ч",
+        "Объект: {}\nАрендатор: {}\n\nСтартовые показания ({base_date}):\n• ХВС: {}\n• ГВС: {}\n• T1: {}\n• T2: {}\n\nТарифы с расчётного месяца {} (дальше действуют, пока вы их не измените):\n• ХВС: {} ₽/м³\n• ГВС: {} ₽/м³\n• Водоотведение: {sewer}\n• T1: {} ₽/кВт·ч\n• T2: {} ₽/кВт·ч",
         answer(a, "property"),
         answer(a, "tenant"),
         dec("base_cold"),
         dec("base_hot"),
         dec("base_t1"),
         dec("base_t2"),
-        answer(a, "tariff_from"),
+        month,
         dec("p_cold"),
         dec("p_hot"),
         dec("p_t1"),
         dec("p_t2"),
     )
+}
+
+/// Запись тарифа месяца `month` (`ГГГГ-ММ`); `valid_from` хранится как первое число месяца.
+pub(crate) async fn insert_tariff(
+    tx: &mut sqlx::SqliteConnection,
+    property_id: i64,
+    code: &str,
+    price: &str,
+    month: &str,
+    enabled: bool,
+    ts: &str,
+) -> Res<()> {
+    sqlx::query(
+        "INSERT INTO tariff (property_id, code, price, valid_from, created_at, enabled) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(property_id, code, valid_from)
+         DO UPDATE SET price = excluded.price, enabled = excluded.enabled, created_at = excluded.created_at",
+    )
+    .bind(property_id)
+    .bind(code)
+    .bind(price)
+    .bind(format!("{month}-01"))
+    .bind(ts)
+    .bind(enabled)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }

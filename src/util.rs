@@ -54,6 +54,15 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         .ok()
 }
 
+/// Расчётный месяц `ГГГГ-ММ` из ввода: `2026-11`, а также полная дата (`2026-11-05`, `05.11.2026`) — берётся её месяц.
+pub fn parse_month(s: &str) -> Option<String> {
+    let t = s.trim();
+    if let Some(d) = parse_date(t) {
+        return Some(period_of(d));
+    }
+    (t.len() == 7 && period_bounds(t).is_some()).then(|| t.to_string())
+}
+
 pub fn period_of(date: NaiveDate) -> String {
     format!("{:04}-{:02}", date.year(), date.month())
 }
@@ -113,6 +122,15 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 7, 25)
         );
         assert_eq!(parse_date("2026-13-01"), None);
+    }
+
+    #[test]
+    fn months_come_from_months_or_full_dates() {
+        assert_eq!(parse_month("2026-11").as_deref(), Some("2026-11"));
+        assert_eq!(parse_month("2026-11-05").as_deref(), Some("2026-11"));
+        assert_eq!(parse_month("05.11.2026").as_deref(), Some("2026-11"));
+        assert_eq!(parse_month("2026-13"), None);
+        assert_eq!(parse_month("ноябрь"), None);
     }
 
     #[test]

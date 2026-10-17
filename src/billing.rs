@@ -45,8 +45,6 @@ pub struct MeterInput {
     pub current: Option<Decimal>,
     /// Тариф за единицу (RUB). `None` — тариф не задан.
     pub tariff: Option<Decimal>,
-    /// Тариф менялся внутри периода — расчёт только вручную (спека §6).
-    pub tariff_changed_in_period: bool,
     /// Явная корректировка замены счётчика разрешает «отрицательный» расход.
     pub replacement_adjustment: bool,
 }
@@ -94,8 +92,6 @@ pub enum BillingError {
     NegativeValue(String),
     #[error("счётчик {0}: расход отрицателен — нужна ручная корректировка (замена/обнуление)")]
     NegativeUsage(String),
-    #[error("счётчик {0}: тариф менялся внутри периода — нужна ручная разбивка")]
-    TariffChangedInPeriod(String),
 }
 
 pub fn round_money(v: Decimal) -> Decimal {
@@ -125,10 +121,6 @@ pub fn calculate_with(
         let previous_raw = m
             .previous
             .ok_or_else(|| BillingError::MissingPrevious(m.meter_id.clone()))?;
-        // Смена тарифа внутри периода важнее «нет тарифа»: цена есть, но выбрать её молча нельзя.
-        if m.tariff_changed_in_period {
-            return Err(BillingError::TariffChangedInPeriod(m.meter_id.clone()));
-        }
         let tariff = m
             .tariff
             .ok_or_else(|| BillingError::MissingTariff(m.meter_id.clone()))?;
@@ -215,7 +207,6 @@ mod tests {
             previous: prev,
             current: curr,
             tariff,
-            tariff_changed_in_period: false,
             replacement_adjustment: false,
         }
     }
@@ -278,16 +269,6 @@ mod tests {
         let mut bad = input(Some(dec!(1)), None, Some(dec!(1)));
         bad.meter_id = "hot".into();
         assert!(calculate(&[ok, bad]).is_err());
-    }
-
-    #[test]
-    fn tariff_change_in_period_requires_manual_split() {
-        let mut m = input(Some(dec!(1)), Some(dec!(2)), Some(dec!(1)));
-        m.tariff_changed_in_period = true;
-        assert_eq!(
-            calculate(&[m]).unwrap_err(),
-            BillingError::TariffChangedInPeriod("cold".into())
-        );
     }
 
     #[test]

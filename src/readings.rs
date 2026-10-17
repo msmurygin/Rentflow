@@ -3,7 +3,6 @@
 //! человеком на сводке вместе со всеми остальными. Ничего не считается и не уходит владельцу до «Отправить».
 
 use crate::app::*;
-use crate::bills::TariffPolicy;
 use crate::ocr::Candidate;
 use crate::util::*;
 use chrono::NaiveDateTime;
@@ -182,17 +181,17 @@ impl App {
         let Some(property_id) = self.property_id().await? else {
             return user_err("Объект не настроен. Начните с /setup");
         };
-        let (name, sewer): (String, bool) =
-            sqlx::query_as("SELECT name, sewer_enabled FROM property WHERE id = ?")
-                .bind(property_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let name: String = sqlx::query_scalar("SELECT name FROM property WHERE id = ?")
+            .bind(property_id)
+            .fetch_one(&self.pool)
+            .await?;
         let linked: Option<i64> =
             sqlx::query_scalar("SELECT tenant_user_id FROM tenancy WHERE property_id = ?")
                 .bind(property_id)
                 .fetch_one(&self.pool)
                 .await?;
         let period = self.open_period(property_id, now).await?;
+        let sewer = self.sewer_for(property_id, &period).await?.is_some();
         let got = self.received(property_id, &period).await?;
         let bills: Vec<(i64, String, String, String)> =
             sqlx::query_as("SELECT id, period, status, total FROM bill WHERE property_id = ? ORDER BY id DESC LIMIT 5")
@@ -227,6 +226,7 @@ impl App {
             for (id, p, status, total) in bills {
                 let st = match status.as_str() {
                     "draft" => "ждёт вашего решения",
+                    "void" => "заменён",
                     "approved" => "утверждён, ждёт оплаты",
                     "rejected" => "отклонён",
                     _ => "оплачен",
@@ -1209,10 +1209,7 @@ impl App {
         self.clear_state(from.telegram_id).await?;
 
         let mut replies = vec![];
-        match self
-            .create_draft(property_id, &period, now, TariffPolicy::Strict)
-            .await
-        {
+        match self.create_draft(property_id, &period, now).await {
             Ok(draft) => {
                 replies.push(Reply::text(
                     from.chat_id,
@@ -1226,66 +1223,18 @@ impl App {
                     "✅ Показания отправлены. Расчёт пока невозможен — владелец уведомлён.",
                 ));
                 let chat = self.landlord_chat(property_id).await?;
-                replies.push(
-                    self.blocked_reply(
-                        chat,
-                        property_id,
-                        &period,
-                        &reason,
-                        "Арендатор прислал все показания",
-                    )
-                    .await?,
-                );
+                replies.push(Reply::text(
+                    chat,
+                    format!("Арендатор прислал все показания за {period}, но расчёт не выполнен:\n{reason}\n\nИсправьте причину (например, /tariff) и нажмите /calc."),
+                ));
             }
             Err(e) => return Err(e),
         }
         Ok(replies)
     }
 
-    /// Сообщение владельцу «расчёт не выполнен». Если причина — смена цены внутри периода, сразу предлагаем решение.
-    pub(crate) async fn blocked_reply(
-        &self,
-        chat: i64,
-        property_id: i64,
-        period: &str,
-        reason: &str,
-        who: &str,
-    ) -> Res<Reply> {
-        let conflicts = self.tariff_conflicts(property_id, period).await?;
-        if conflicts.is_empty() {
-            return Ok(Reply::text(
-                chat,
-                format!(
-                    "{who} за {period}, но расчёт не выполнен:\n{reason}\n\nИсправьте причину (например, /tariff) и нажмите /calc."
-                ),
-            ));
-        }
-        Ok(Reply::with_buttons(
-            chat,
-            format!(
-                "{who} за {period}, но в периоде менялась цена:\n{}\n\nАвтоматически разделить расход по дням я не могу — это ваше решение. \
-                 Выберите, какую цену применить ко всему периоду (выбор запишется в счёт), либо поправьте даты тарифов: /tariffs, /tariff.",
-                conflicts.join("\n")
-            ),
-            vec![
-                vec![("Применить новую цену ко всему периоду", "cn".into())],
-                vec![("Применить прежнюю цену ко всему периоду", "co".into())],
-            ],
-        ))
-    }
-
     /// Владелец повторно запускает расчёт открытого периода, когда все показания уже приняты.
     pub(crate) async fn calc_cmd(&self, from: &Sender, now: NaiveDateTime) -> Res<Vec<Reply>> {
-        self.calc_with(from, now, TariffPolicy::Strict).await
-    }
-
-    /// То же с явным решением о цене, которая менялась внутри периода.
-    pub(crate) async fn calc_with(
-        &self,
-        from: &Sender,
-        now: NaiveDateTime,
-        policy: TariffPolicy,
-    ) -> Res<Vec<Reply>> {
         let Some(property_id) = self.property_id().await? else {
             return user_err("Объект не настроен.");
         };
@@ -1300,17 +1249,9 @@ impl App {
                 Self::status_text(&period, &got)
             ));
         }
-        match self.create_draft(property_id, &period, now, policy).await {
-            Ok(draft) => {
-                let mut reply = self.draft_to_landlord(property_id, &draft).await?;
-                reply.chat_id = from.chat_id;
-                Ok(vec![reply])
-            }
-            Err(AppError::User(reason)) => Ok(vec![
-                self.blocked_reply(from.chat_id, property_id, &period, &reason, "Расчёт")
-                    .await?,
-            ]),
-            Err(e) => Err(e),
-        }
+        let draft = self.create_draft(property_id, &period, now).await?;
+        let mut reply = self.draft_to_landlord(property_id, &draft).await?;
+        reply.chat_id = from.chat_id;
+        Ok(vec![reply])
     }
 }

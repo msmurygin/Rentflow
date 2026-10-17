@@ -52,7 +52,6 @@ fn inputs(p: &Value) -> Vec<MeterInput> {
             previous: Some(reading(p, reg, "previous")),
             current: Some(reading(p, reg, "current")),
             tariff: Some(tariff(p, reg)),
-            tariff_changed_in_period: false,
             replacement_adjustment: false,
         })
         .collect()
@@ -139,7 +138,6 @@ fn floor_before_delta_not_floor_of_delta() {
         previous: Some(dec("753.015")),
         current: Some(dec("755.589")),
         tariff: Some(dec("65.77")),
-        tariff_changed_in_period: false,
         replacement_adjustment: false,
     };
     let floored = calculate(&[make(ReadingPrecision::FloorBeforeDelta)]).unwrap();
@@ -251,7 +249,6 @@ fn bootstrap_baseline_alone_bills_nothing() {
             previous: Some(Decimal::from(b[*reg].as_i64().unwrap())),
             current: None,
             tariff: Some(dec("1")),
-            tariff_changed_in_period: false,
             replacement_adjustment: false,
         })
         .collect();

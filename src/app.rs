@@ -133,7 +133,7 @@ pub enum State {
     Proof { code: String, edit: bool },
     /// Меню тарифов: выбрана ли дата, номер шага и ответы (`keep` | `off` | цена).
     Tariff {
-        date: Option<String>,
+        month: Option<String>,
         step: usize,
         answers: Vec<String>,
     },
@@ -373,6 +373,7 @@ impl App {
                 "/tariffs" => self.tariff_history(from, now).await,
                 "/proof" => self.proof_cmd(from).await,
                 "/paid" => self.paid_list(from).await,
+                "/reissue" => self.reissue_list(from).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),
@@ -408,19 +409,16 @@ impl App {
             (Who::Landlord(_), "ap") => self.bill_approve(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rj") => self.bill_reject(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "pd") => self.bill_paid(from, id.unwrap_or(0), now).await,
-            (Who::Landlord(_), "cn") => {
-                self.calc_with(from, now, crate::bills::TariffPolicy::NewForWholePeriod)
-                    .await
-            }
-            (Who::Landlord(_), "co") => {
-                self.calc_with(from, now, crate::bills::TariffPolicy::OldForWholePeriod)
-                    .await
-            }
             (Who::Landlord(_), "cc") => self.calc_cmd(from, now).await,
             (Who::Landlord(_), "pr") => self.proof_set(from, a.unwrap_or("")).await,
             (Who::Landlord(_), "th") => self.tariff_history(from, now).await,
             (Who::Landlord(_), "tnew") => self.tariff_start(from, now).await,
-            (Who::Landlord(_), "td") => self.tariff_date(from, a.unwrap_or(""), now).await,
+            (Who::Landlord(_), "tm") => self.tariff_month(from, a.unwrap_or(""), now).await,
+            (Who::Landlord(_), "ri") => self.reissue_ask(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "rc") => self.reissue_do(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "rx") => {
+                Ok(vec![Reply::text(from.chat_id, "Оставлено без изменений.")])
+            }
             (Who::Landlord(_), "tk") => self.tariff_answer(from, "keep", now).await,
             (Who::Landlord(_), "toff") => self.tariff_answer(from, "off", now).await,
             (Who::Landlord(_), "ts") => self.tariff_save(from, now).await,

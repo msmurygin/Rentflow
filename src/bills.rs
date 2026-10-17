@@ -28,9 +28,6 @@ pub struct Snapshot {
     pub currency: String,
     pub total: String,
     pub policy: String,
-    /// Явные решения владельца (например, какой тариф применён при смене цены внутри периода).
-    #[serde(default)]
-    pub note: Option<String>,
     pub lines: Vec<SnapLine>,
 }
 
@@ -51,12 +48,6 @@ fn explain(e: &BillingError) -> String {
             "{}: расход отрицательный — нужна ручная корректировка (замена счётчика?)",
             l(id)
         ),
-        BillingError::TariffChangedInPeriod(id) => {
-            format!(
-                "{}: тариф менялся внутри периода — нужна ручная разбивка, автоматически не считаю",
-                l(id)
-            )
-        }
     }
 }
 
@@ -68,120 +59,33 @@ fn kind_of(code: &str) -> MeterKind {
     }
 }
 
-/// Как поступить, если цена позиции менялась внутри расчётного периода.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TariffPolicy {
-    /// Не считать, пока владелец не решит (по умолчанию).
-    Strict,
-    /// Решение владельца: для всего периода взять новую цену.
-    NewForWholePeriod,
-    /// Решение владельца: для всего периода взять прежнюю цену.
-    OldForWholePeriod,
-}
-
-/// Цена менялась внутри периода: была `old`, стала `new` с даты `from`.
+/// Версия тарифа: действует с расчётного месяца `month` (`ГГГГ-ММ`) и дальше, пока её не заменит более поздняя.
+/// `enabled` нужен водоотведению: выключение, как и цена, действует по месяцам.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TariffSplit {
-    pub old: Decimal,
-    pub new: Decimal,
-    pub from: String,
+pub struct TariffRow {
+    pub month: String,
+    pub price: Decimal,
+    pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PickError {
-    Missing,
-    Split(TariffSplit),
-}
-
-/// Выбор цены за период `[start, end]` (ISO-даты) из версий тарифа по возрастанию даты начала.
-///
-/// * Действует последняя версия, начавшаяся не позже начала периода; если такой нет, то самая первая версия:
-///   до неё тарифа не существовало, делить нечего (первый тариф, заведённый посреди месяца, — не «смена»).
-/// * Сменой считается только версия внутри периода с **другой** ценой; версия с той же ценой ничего не меняет.
-pub fn pick_tariff(
-    versions: &[(String, Decimal)],
-    start: &str,
-    end: &str,
-    policy: TariffPolicy,
-) -> Result<(Decimal, Option<TariffSplit>), PickError> {
-    if versions.is_empty() {
-        return Err(PickError::Missing);
-    }
-    let base = versions
+/// Тариф, действующий в расчётном месяце `period`: последняя версия с месяцем не позже него.
+/// Внутри месяца тариф не меняется — он всегда относится к месяцу целиком (без пропорций и разбивки по дням).
+pub fn effective_tariff<'a>(versions: &'a [TariffRow], period: &str) -> Option<&'a TariffRow> {
+    versions
         .iter()
-        .rposition(|v| v.0.as_str() <= start)
-        .unwrap_or(0);
-    let old = versions[base].1;
-    let mut current = old;
-    let mut split: Option<TariffSplit> = None;
-    for (date, price) in &versions[base + 1..] {
-        if date.as_str() > end {
-            break;
-        }
-        if *price != current {
-            split = Some(match split {
-                None => TariffSplit {
-                    old,
-                    new: *price,
-                    from: date.clone(),
-                },
-                Some(s) => TariffSplit { new: *price, ..s },
-            });
-            current = *price;
-        }
-    }
-    match (split, policy) {
-        (None, _) => Ok((old, None)),
-        (Some(s), TariffPolicy::Strict) => Err(PickError::Split(s)),
-        (Some(s), TariffPolicy::NewForWholePeriod) => Ok((s.new, Some(s))),
-        (Some(s), TariffPolicy::OldForWholePeriod) => Ok((old, Some(s))),
-    }
+        .filter(|v| v.month.as_str() <= period)
+        .max_by(|a, b| a.month.cmp(&b.month))
 }
 
 impl App {
-    /// Цена тарифа, действующая в расчётном периоде (см. `pick_tariff`). Реальная смена цены внутри периода без явного
-    /// решения владельца — отказ, а не молчаливый выбор; решение владельца записывается в `notes` и попадает в счёт.
-    async fn tariff_for(
-        &self,
-        property_id: i64,
-        code: &str,
-        period: &str,
-        policy: TariffPolicy,
-        notes: &mut Vec<String>,
-    ) -> Res<Result<Decimal, BillingError>> {
-        let (first, last) =
-            period_bounds(period).ok_or_else(|| AppError::User("Некорректный период.".into()))?;
-        let versions = self.tariff_versions(property_id, code).await?;
-        Ok(
-            match pick_tariff(&versions, &first.to_string(), &last.to_string(), policy) {
-                Ok((price, split)) => {
-                    if let Some(s) = split {
-                        notes.push(format!(
-                        "{}: в периоде менялась цена ({} → {} ₽ с {}); по решению владельца для всего периода применён {} тариф ({} ₽)",
-                        label(code),
-                        money(s.old),
-                        money(s.new),
-                        s.from,
-                        if policy == TariffPolicy::NewForWholePeriod { "новый" } else { "прежний" },
-                        money(price)
-                    ));
-                    }
-                    Ok(price)
-                }
-                Err(PickError::Missing) => Err(BillingError::MissingTariff(code.into())),
-                Err(PickError::Split(_)) => Err(BillingError::TariffChangedInPeriod(code.into())),
-            },
-        )
-    }
-
-    /// Версии тарифа позиции по возрастанию даты начала.
+    /// Версии тарифа позиции по возрастанию месяца.
     pub(crate) async fn tariff_versions(
         &self,
         property_id: i64,
         code: &str,
-    ) -> Res<Vec<(String, Decimal)>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT valid_from, price FROM tariff WHERE property_id = ? AND code = ? ORDER BY valid_from ASC",
+    ) -> Res<Vec<TariffRow>> {
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT substr(valid_from, 1, 7), price, enabled FROM tariff WHERE property_id = ? AND code = ? ORDER BY valid_from ASC",
         )
         .bind(property_id)
         .bind(code)
@@ -189,61 +93,40 @@ impl App {
         .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(d, p)| Some((d, p.parse().ok()?)))
+            .filter_map(|(month, price, enabled)| {
+                Some(TariffRow {
+                    month,
+                    price: price.parse().ok()?,
+                    enabled,
+                })
+            })
             .collect())
     }
 
-    /// Позиции, у которых цена реально менялась внутри периода: «ХВС: 50,00 → 52,00 ₽ с 2026-10-15».
-    pub(crate) async fn tariff_conflicts(
+    /// Цена позиции за расчётный месяц целиком (см. `effective_tariff`).
+    async fn tariff_for(
         &self,
         property_id: i64,
+        code: &str,
         period: &str,
-    ) -> Res<Vec<String>> {
-        let Some((first, last)) = period_bounds(period) else {
-            return Ok(vec![]);
-        };
-        let sewer_on: bool = sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
-            .bind(property_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let mut lines = vec![];
-        for code in ["cold", "hot", "sewer", "t1", "t2"] {
-            if code == "sewer" && !sewer_on {
-                continue;
-            }
-            let versions = self.tariff_versions(property_id, code).await?;
-            if let Err(PickError::Split(s)) = pick_tariff(
-                &versions,
-                &first.to_string(),
-                &last.to_string(),
-                TariffPolicy::Strict,
-            ) {
-                lines.push(format!(
-                    "• {}: {} → {} ₽ с {}",
-                    label(code),
-                    money(s.old),
-                    money(s.new),
-                    s.from
-                ));
-            }
-        }
-        Ok(lines)
+    ) -> Res<Result<Decimal, BillingError>> {
+        let versions = self.tariff_versions(property_id, code).await?;
+        Ok(match effective_tariff(&versions, period) {
+            Some(t) => Ok(t.price),
+            None => Err(BillingError::MissingTariff(code.into())),
+        })
     }
 
-    /// Создаёт черновик счёта за период по подтверждённым показаниям. Дубль за период невозможен (уникальный индекс).
-    pub(crate) async fn create_draft(
-        &self,
-        property_id: i64,
-        period: &str,
-        now: NaiveDateTime,
-        policy: TariffPolicy,
-    ) -> Res<Draft> {
-        let mut notes: Vec<String> = vec![];
-        let sewer_enabled: bool =
-            sqlx::query_scalar("SELECT sewer_enabled FROM property WHERE id = ?")
-                .bind(property_id)
-                .fetch_one(&self.pool)
-                .await?;
+    /// Водоотведение за месяц: нет настройки или выключено — строки в счёте нет. Включение действует по месяцам, как цена.
+    pub(crate) async fn sewer_for(&self, property_id: i64, period: &str) -> Res<Option<SewerRule>> {
+        let versions = self.tariff_versions(property_id, "sewer").await?;
+        Ok(effective_tariff(&versions, period)
+            .filter(|t| t.enabled)
+            .map(|t| SewerRule { tariff: t.price }))
+    }
+
+    /// Считает снимок счёта за период по подтверждённым показаниям и тарифам, действующим в этом месяце.
+    pub(crate) async fn compute_draft(&self, property_id: i64, period: &str) -> Res<Snapshot> {
         let mut inputs = Vec::with_capacity(4);
         let mut prev_dates: Vec<Option<String>> = Vec::new();
         for (code, _, _) in REGISTERS {
@@ -268,9 +151,7 @@ impl App {
             .bind(period)
             .fetch_optional(&self.pool)
             .await?;
-            let tariff = self
-                .tariff_for(property_id, code, period, policy, &mut notes)
-                .await?;
+            let tariff = self.tariff_for(property_id, code, period).await?;
             prev_dates.push(previous.as_ref().and_then(|p| p.1.clone()));
             inputs.push(MeterInput {
                 meter_id: code.into(),
@@ -279,33 +160,18 @@ impl App {
                 precision: ReadingPrecision::FloorBeforeDelta,
                 previous: previous.and_then(|p| p.0.parse().ok()),
                 current: current.and_then(|c| c.0.parse().ok()),
-                tariff: tariff.as_ref().ok().copied(),
-                tariff_changed_in_period: matches!(
-                    tariff,
-                    Err(BillingError::TariffChangedInPeriod(_))
-                ),
+                tariff: tariff.ok(),
                 replacement_adjustment: false,
             });
         }
-        let sewer = if sewer_enabled {
-            match self
-                .tariff_for(property_id, "sewer", period, policy, &mut notes)
-                .await?
-            {
-                Ok(tariff) => Some(SewerRule { tariff }),
-                Err(e) => return user_err(explain(&e)),
-            }
-        } else {
-            None
-        };
+        let sewer = self.sewer_for(property_id, period).await?;
         let bill =
             billing::calculate_with(&inputs, sewer).map_err(|e| AppError::User(explain(&e)))?;
-        let snapshot = Snapshot {
+        Ok(Snapshot {
             period: period.into(),
             currency: "RUB".into(),
             total: bill.total.to_string(),
-            policy: "Из каждого накопительного показания берётся целая часть до вычитания; водоотведение = ХВС + ГВС".into(),
-            note: (!notes.is_empty()).then(|| notes.join("\n")),
+            policy: "Из каждого накопительного показания берётся целая часть до вычитания; водоотведение = ХВС + ГВС; тарифы — по расчётному месяцу целиком".into(),
             lines: bill
                 .lines
                 .iter()
@@ -322,7 +188,27 @@ impl App {
                     previous_read_on: prev_dates.get(i).cloned().flatten(),
                 })
                 .collect(),
-        };
+        })
+    }
+
+    /// Создаёт черновик счёта за период. Дубль за период невозможен (уникальный индекс).
+    pub(crate) async fn create_draft(
+        &self,
+        property_id: i64,
+        period: &str,
+        now: NaiveDateTime,
+    ) -> Res<Draft> {
+        let snapshot = self.compute_draft(property_id, period).await?;
+        self.insert_draft(property_id, period, snapshot, now).await
+    }
+
+    pub(crate) async fn insert_draft(
+        &self,
+        property_id: i64,
+        period: &str,
+        snapshot: Snapshot,
+        now: NaiveDateTime,
+    ) -> Res<Draft> {
         let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
         let inserted = sqlx::query(
             "INSERT INTO bill (property_id, period, version, status, total, snapshot, created_at)
@@ -332,7 +218,7 @@ impl App {
         .bind(period)
         .bind(property_id)
         .bind(period)
-        .bind(bill.total.to_string())
+        .bind(&snapshot.total)
         .bind(&json)
         .bind(now_iso(now))
         .execute(&self.pool)
@@ -347,6 +233,57 @@ impl App {
             )),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Тарифы с месяца `from_month` изменились: черновики этого и последующих месяцев пересчитываются по новым тарифам.
+    /// Утверждённые и оплаченные счета не затрагиваются никогда.
+    pub(crate) async fn refresh_drafts(
+        &self,
+        property_id: i64,
+        from_month: &str,
+        now: NaiveDateTime,
+    ) -> Res<Vec<Reply>> {
+        let drafts: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, period, snapshot FROM bill WHERE property_id = ? AND status = 'draft' AND period >= ? ORDER BY period",
+        )
+        .bind(property_id)
+        .bind(from_month)
+        .fetch_all(&self.pool)
+        .await?;
+        let chat = self.landlord_chat(property_id).await?;
+        let mut replies = vec![];
+        for (id, period, old) in drafts {
+            let old_json = serde_json::from_str::<Snapshot>(&old)
+                .ok()
+                .and_then(|s| serde_json::to_string(&s).ok());
+            let fresh = self.compute_draft(property_id, &period).await;
+            if let (Ok(new), Some(old_json)) = (&fresh, &old_json)
+                && serde_json::to_string(new).ok().as_deref() == Some(old_json.as_str())
+            {
+                continue; // тарифы изменились, но этот месяц они не затронули
+            }
+            let voided = sqlx::query("UPDATE bill SET status = 'void', note = 'тарифы изменились', decided_at = ? WHERE id = ? AND status = 'draft'")
+                .bind(now_iso(now))
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            if voided.rows_affected() != 1 {
+                continue;
+            }
+            match fresh {
+                Ok(snapshot) => {
+                    let draft = self.insert_draft(property_id, &period, snapshot, now).await?;
+                    replies.push(Reply::text(chat, format!("🔄 Тарифы изменились — черновик за {period} пересчитан по новым тарифам. Прежний черновик отменён.")));
+                    replies.push(self.draft_to_landlord(property_id, &draft).await?);
+                }
+                Err(AppError::User(reason)) => replies.push(Reply::text(
+                    chat,
+                    format!("🔄 Тарифы изменились — прежний черновик за {period} отменён, но пересчитать не удалось:\n{reason}\nИсправьте причину и нажмите /calc."),
+                )),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(replies)
     }
 
     pub(crate) async fn draft_to_landlord(&self, property_id: i64, d: &Draft) -> Res<Reply> {
@@ -404,7 +341,11 @@ impl App {
         Ok(reply)
     }
 
-    async fn load_bill(&self, from: &Sender, id: i64) -> Res<(i64, String, String, Snapshot)> {
+    pub(crate) async fn load_bill(
+        &self,
+        from: &Sender,
+        id: i64,
+    ) -> Res<(i64, String, String, Snapshot)> {
         // Счёт должен принадлежать объекту этого владельца.
         let row: Option<(i64, String, String, String)> = sqlx::query_as(
             "SELECT b.property_id, b.period, b.status, b.snapshot FROM bill b
@@ -423,7 +364,7 @@ impl App {
         Ok((property_id, period, status, snap))
     }
 
-    async fn tenant_chat(&self, property_id: i64) -> Res<Option<i64>> {
+    pub(crate) async fn tenant_chat(&self, property_id: i64) -> Res<Option<i64>> {
         Ok(sqlx::query_scalar("SELECT u.chat_id FROM tenancy t JOIN app_user u ON u.id = t.tenant_user_id WHERE t.property_id = ?")
             .bind(property_id)
             .fetch_optional(&self.pool)
@@ -436,7 +377,7 @@ impl App {
         id: i64,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let (property_id, period, _, snap) = self.load_bill(from, id).await?;
+        let (property_id, period, status, snap) = self.load_bill(from, id).await?;
         // Решение принимается ровно один раз: повторное нажатие ничего не рассылает.
         let done = sqlx::query(
             "UPDATE bill SET status = 'approved', decided_at = ? WHERE id = ? AND status = 'draft'",
@@ -446,7 +387,7 @@ impl App {
         .execute(&self.pool)
         .await?;
         if done.rows_affected() != 1 {
-            return Ok(vec![Reply::text(from.chat_id, "Этот счёт уже обработан.")]);
+            return Ok(vec![Reply::text(from.chat_id, already_decided(&status))]);
         }
         let mut replies = vec![];
         if let Some(chat) = self.tenant_chat(property_id).await? {
@@ -475,7 +416,7 @@ impl App {
         id: i64,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        let (property_id, period, _, _) = self.load_bill(from, id).await?;
+        let (property_id, period, status, _) = self.load_bill(from, id).await?;
         let done = sqlx::query(
             "UPDATE bill SET status = 'rejected', decided_at = ? WHERE id = ? AND status = 'draft'",
         )
@@ -484,7 +425,7 @@ impl App {
         .execute(&self.pool)
         .await?;
         if done.rows_affected() != 1 {
-            return Ok(vec![Reply::text(from.chat_id, "Этот счёт уже обработан.")]);
+            return Ok(vec![Reply::text(from.chat_id, already_decided(&status))]);
         }
         // Показания периода открываются заново; история в таблице reading сохраняется (status = superseded).
         self.supersede_period(property_id, &period).await?;
@@ -621,129 +562,38 @@ pub fn format_bill(s: &Snapshot) -> String {
         out.push(line);
     }
     out.push(format!("\nИтого: {} ₽", money(d(&s.total))));
-    if let Some(note) = &s.note {
-        out.push(format!("\nℹ️ {note}"));
-    }
     out.join("\n")
 }
 
+/// Почему кнопка под счётом больше не работает.
+fn already_decided(status: &str) -> &'static str {
+    if status == "void" {
+        "Этот черновик устарел: тарифы изменились. Откройте обновлённый расчёт."
+    } else {
+        "Этот счёт уже обработан."
+    }
+}
+
 #[cfg(test)]
-mod pick_tests {
+mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    fn v(items: &[(&str, Decimal)]) -> Vec<(String, Decimal)> {
-        items.iter().map(|(d, p)| (d.to_string(), *p)).collect()
-    }
-
-    const START: &str = "2026-10-01";
-    const END: &str = "2026-10-31";
-
-    #[test]
-    fn empty_means_missing() {
-        assert_eq!(
-            pick_tariff(&[], START, END, TariffPolicy::Strict),
-            Err(PickError::Missing)
-        );
+    fn v(month: &str, price: Decimal) -> TariffRow {
+        TariffRow {
+            month: month.into(),
+            price,
+            enabled: true,
+        }
     }
 
     #[test]
-    fn the_first_ever_tariff_starting_mid_period_is_not_a_change() {
-        // тариф заведён 15 октября, до него тарифа не было: делить нечего
-        let versions = v(&[("2026-10-15", dec!(50))]);
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Ok((dec!(50), None))
-        );
-    }
-
-    #[test]
-    fn a_version_before_the_period_is_used() {
-        let versions = v(&[("2026-01-01", dec!(50)), ("2026-09-01", dec!(55))]);
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Ok((dec!(55), None))
-        );
-    }
-
-    #[test]
-    fn a_version_starting_on_the_first_day_is_not_a_change() {
-        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-01", dec!(55))]);
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Ok((dec!(55), None))
-        );
-    }
-
-    #[test]
-    fn a_later_version_with_the_same_price_is_not_a_change() {
-        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-15", dec!(50.00))]);
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Ok((dec!(50), None))
-        );
-    }
-
-    #[test]
-    fn a_real_change_inside_the_period_needs_a_decision() {
-        let versions = v(&[("2026-01-01", dec!(50)), ("2026-10-15", dec!(52))]);
-        let split = TariffSplit {
-            old: dec!(50),
-            new: dec!(52),
-            from: "2026-10-15".into(),
-        };
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Err(PickError::Split(split.clone()))
-        );
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::NewForWholePeriod),
-            Ok((dec!(52), Some(split.clone())))
-        );
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::OldForWholePeriod),
-            Ok((dec!(50), Some(split)))
-        );
-    }
-
-    #[test]
-    fn two_changes_report_the_first_date_and_the_final_price() {
-        let versions = v(&[
-            ("2026-01-01", dec!(50)),
-            ("2026-10-10", dec!(52)),
-            ("2026-10-20", dec!(53)),
-        ]);
-        let Err(PickError::Split(s)) = pick_tariff(&versions, START, END, TariffPolicy::Strict)
-        else {
-            panic!()
-        };
-        assert_eq!(
-            (s.old, s.new, s.from.as_str()),
-            (dec!(50), dec!(53), "2026-10-10")
-        );
-    }
-
-    #[test]
-    fn versions_after_the_period_are_ignored() {
-        let versions = v(&[("2026-01-01", dec!(50)), ("2026-11-01", dec!(60))]);
-        assert_eq!(
-            pick_tariff(&versions, START, END, TariffPolicy::Strict),
-            Ok((dec!(50), None))
-        );
-    }
-
-    #[test]
-    fn an_earlier_dated_version_added_later_is_ordered_by_date_not_by_entry() {
-        // владелец ввёл «новые» цены датой 1 октября поверх заведённых с 15 октября (случай из жизни):
-        // 1 окт = 51, 15 окт = 50 → внутри периода цена вернулась к 50, это смена
-        let versions = v(&[("2026-10-01", dec!(51)), ("2026-10-15", dec!(50))]);
-        let Err(PickError::Split(s)) = pick_tariff(&versions, START, END, TariffPolicy::Strict)
-        else {
-            panic!()
-        };
-        assert_eq!(
-            (s.old, s.new, s.from.as_str()),
-            (dec!(51), dec!(50), "2026-10-15")
-        );
+    fn the_latest_version_not_after_the_month_applies_to_the_whole_month() {
+        let vs = [v("2026-08", dec!(8)), v("2026-10", dec!(9))];
+        assert_eq!(effective_tariff(&vs, "2026-07"), None);
+        assert_eq!(effective_tariff(&vs, "2026-09").unwrap().price, dec!(8));
+        assert_eq!(effective_tariff(&vs, "2026-10").unwrap().price, dec!(9));
+        // тариф переносится на следующие месяцы, пока не заменён
+        assert_eq!(effective_tariff(&vs, "2027-03").unwrap().price, dec!(9));
     }
 }
