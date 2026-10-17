@@ -1,6 +1,9 @@
-# Запуск на сервере или личном компьютере:  docker compose up -d --build
-# Логи:                                      docker compose logs -f
-# Остановка:                                 docker compose down   (данные в томе сохраняются)
+# Запуск на сервере:  docker compose up -d --build        (перед обновлением: deploy/deploy.sh — он делает резервную копию)
+# Логи:               docker compose logs -f
+# Остановка:          docker compose down                 (данные в томах сохраняются)
+#
+# caddy — единственный, кто слушает порты хоста (80/443, сертификат Let's Encrypt для $DOMAIN).
+# rentflow наружу портов не публикует: Caddy ходит к нему по внутренней сети.
 services:
   rentflow:
     build: .
@@ -13,5 +16,21 @@ services:
     volumes:
       - rentflow-data:/data
 
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [rentflow]
+    environment:
+      DOMAIN: ${DOMAIN:?задайте DOMAIN в .env (например rentflow.example.com)}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   rentflow-data:
+  caddy-data:
+  caddy-config:

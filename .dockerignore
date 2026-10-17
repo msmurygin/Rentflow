@@ -4,3 +4,6 @@ data
 .env
 docs
 tests
+web/node_modules
+web/dist
+backups

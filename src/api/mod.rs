@@ -562,7 +562,9 @@ async fn home(State(st): St, ctx: Ctx) -> ApiResult {
 }
 
 async fn meters(State(st): St, ctx: Ctx) -> ApiResult {
-    let property_id = st.need_property(&ctx).await?;
+    let Some(property_id) = st.property_of(&ctx).await? else {
+        return Ok(Json(json!({ "period": null, "registers": [] })));
+    };
     let period = st.app.open_period(property_id, st.now()).await?;
     let mut out = vec![];
     for (code, lbl, unit) in REGISTERS {
@@ -865,7 +867,10 @@ async fn bill_for(st: &ApiState, ctx: &Ctx, id: i64) -> Result<BillRow, ApiError
 }
 
 async fn bills_list(State(st): St, ctx: Ctx) -> ApiResult {
-    let property_id = st.need_property(&ctx).await?;
+    // объект ещё не настроен — счетов нет, это не ошибка
+    let Some(property_id) = st.property_of(&ctx).await? else {
+        return Ok(Json(json!({ "bills": [] })));
+    };
     let visible = if matches!(ctx.role, Role::Landlord(_)) {
         "'draft','approved','paid','rejected'"
     } else {

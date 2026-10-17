@@ -1,0 +1,72 @@
+@import 'tailwindcss';
+
+:root {
+  --bg: #f2f3f7;
+  --surface: #ffffff;
+  --surface-2: #eceef4;
+  --fg: #12141a;
+  --muted: #6b7280;
+  --line: #e2e5ee;
+  --brand: #2f6bff;
+  --brand-fg: #ffffff;
+  --ok: #12a150;
+  --warn: #c77700;
+  --bad: #d92d3a;
+  color-scheme: light;
+}
+:root[data-theme='dark'] {
+  --bg: #0e1015;
+  --surface: #181b23;
+  --surface-2: #232733;
+  --fg: #f1f3f8;
+  --muted: #98a0b3;
+  --line: #2a2f3c;
+  --brand: #5b8cff;
+  --brand-fg: #0b1020;
+  --ok: #3ccf7a;
+  --warn: #f0b44a;
+  --bad: #ff6b76;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface2: var(--surface-2);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-brand: var(--brand);
+  --color-brandfg: var(--brand-fg);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, system-ui, sans-serif;
+}
+
+@layer base {
+  html,
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior-y: none;
+  }
+  button {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+@layer base {
+  input,
+  select {
+    font-size: 16px; /* меньше 16px iOS увеличивает страницу при фокусе */
+  }
+}

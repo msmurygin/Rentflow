@@ -784,3 +784,41 @@ async fn session_dies_when_access_is_revoked() {
     let (s, _) = api.call(Method::GET, "/api/me", Some(&tenant), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn static_frontend_and_health_are_served_without_auth() {
+    let dir = std::env::temp_dir().join(format!("rentflow-web-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("index.html"),
+        "<!doctype html><title>RentFlow</title>",
+    )
+    .unwrap();
+    let api = Api::new().await;
+    let state = Arc::new(ApiState::new(
+        api.app.clone(),
+        api.outbox.clone(),
+        TOKEN.into(),
+        3,
+    ));
+    let app = router(state, Some(dir));
+    for path in ["/", "/healthz", "/some/client/route"] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    // API по-прежнему закрыт
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
