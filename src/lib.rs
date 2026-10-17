@@ -2,11 +2,13 @@
 
 pub mod api;
 pub mod app;
+pub mod backup;
 pub mod billing;
 pub mod bills;
 pub mod bot;
 pub mod db;
 pub mod ocr;
+pub mod ops;
 pub mod readings;
 pub mod reissue;
 pub mod reminders;

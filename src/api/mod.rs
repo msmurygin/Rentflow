@@ -944,7 +944,9 @@ async fn bill_detail(State(st): St, ctx: Ctx, Path(id): Path<i64>) -> ApiResult 
     v["can_reject"] = json!(landlord && b.status == "draft");
     v["can_mark_paid"] = json!(landlord && b.status == "approved");
     v["can_reissue"] = json!(landlord && b.status == "approved");
-    v["can_void"] = json!(landlord && (b.status == "approved" || b.status == "paid"));
+    v["can_void"] = json!(
+        landlord && (b.status == "approved" || (b.status == "paid" && st.app.cfg.allow_void_paid))
+    );
     Ok(Json(v))
 }
 
@@ -1047,6 +1049,21 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Готовность: база отвечает, Telegram жив, диск и резервные копии в норме. 503 — внешний мониторинг должен сработать.
+async fn readyz(State(st): St) -> (StatusCode, Json<Value>) {
+    let v = st.app.vitals(st.now(), (st.clock)().timestamp()).await;
+    let alerts: Vec<&str> = crate::ops::evaluate(&v).iter().map(|a| a.key).collect();
+    let code = if alerts.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(json!({ "ok": alerts.is_empty(), "alerts": alerts })),
+    )
+}
+
 pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/auth/telegram", post(auth_telegram))
@@ -1077,6 +1094,7 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/photos/{id}", get(reading_photo));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .nest("/api", api)
         .with_state(state);
     if let Some(dir) = static_dir {

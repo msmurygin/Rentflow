@@ -15,9 +15,13 @@ impl App {
         .bind(from.telegram_id)
         .fetch_all(&self.pool)
         .await?;
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.3 != "paid" || self.cfg.allow_void_paid)
+            .collect();
         if rows.is_empty() {
             return user_err(
-                "Нет утверждённых или оплаченных счетов. Черновик отклоняется кнопкой «Отклонить» под расчётом.",
+                "Нет утверждённых неоплаченных счетов. Оплаченный счёт аннулировать нельзя; черновик отклоняется кнопкой «Отклонить» под расчётом.",
             );
         }
         let buttons = rows
@@ -48,8 +52,12 @@ impl App {
     /// Выбран счёт: просим причину.
     pub(crate) async fn void_pick(&self, from: &Sender, id: i64) -> Res<Vec<Reply>> {
         let (_, period, status, _) = self.load_bill(from, id).await?;
-        if status != "approved" && status != "paid" {
-            return user_err("Аннулировать можно только утверждённый или оплаченный счёт.");
+        if status != "approved" && !(status == "paid" && self.cfg.allow_void_paid) {
+            return user_err(if status == "paid" {
+                "Счёт уже оплачен — аннулировать его нельзя."
+            } else {
+                "Аннулировать можно только утверждённый неоплаченный счёт."
+            });
         }
         self.set_state(
             from.telegram_id,
@@ -156,6 +164,9 @@ impl App {
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
         let (property_id, period, status, snap) = self.load_bill(from, id).await?;
+        if status == "paid" && !self.cfg.allow_void_paid {
+            return user_err("Оплаченный счёт аннулировать нельзя.");
+        }
         if status != "approved" && status != "paid" {
             return user_err("Счёт уже изменён (аннулирован или заменён) — ничего не сделано.");
         }

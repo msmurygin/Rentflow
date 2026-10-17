@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{path::PathBuf, sync::Arc};
 
+#[derive(Default)]
 pub struct Config {
     /// Единственный владелец: только этот Telegram-ID может настраивать объект и утверждать счета.
     pub landlord_telegram_id: i64,
@@ -17,9 +18,19 @@ pub struct Config {
     pub invite_ttl_days: i64,
     /// Фото уходят во внешний ИИ-сервис распознавания — арендатору об этом сообщается.
     pub ocr_enabled: bool,
+    /// Разрешено ли аннулировать ОПЛАЧЕННЫЙ счёт (только для тестовых данных; по умолчанию нет).
+    pub allow_void_paid: bool,
+    /// Администратор сервиса: получает алерты мониторинга. Никаких прав на данные пользователей.
+    pub admin_telegram_id: Option<i64>,
+    /// Каталог данных (база, фото, резервные копии): по нему проверяется свободное место и статус бэкапов.
+    pub data_dir: Option<PathBuf>,
+    /// Выгрузка копий за пределы сервера настроена: мониторинг требует свежую отметку `last_offsite.json`.
+    pub offsite_expected: bool,
 }
 
 pub struct App {
+    /// Unix-время последнего успешного ответа Telegram (0 — ещё не опрашивали); нужно мониторингу.
+    pub(crate) telegram_ok_at: std::sync::atomic::AtomicI64,
     pub(crate) pool: SqlitePool,
     pub(crate) cfg: Config,
     pub(crate) extractor: Arc<dyn Extractor>,
@@ -154,6 +165,7 @@ pub fn now_iso(now: NaiveDateTime) -> String {
 impl App {
     pub fn new(pool: SqlitePool, cfg: Config, extractor: Arc<dyn Extractor>) -> Self {
         Self {
+            telegram_ok_at: std::sync::atomic::AtomicI64::new(0),
             pool,
             cfg,
             extractor,
@@ -453,6 +465,46 @@ impl App {
                 user_err("Эта кнопка устарела. Нажмите /enter — ввод теперь идёт по шагам.")
             }
             _ => user_err("Это действие вам недоступно."),
+        }
+    }
+}
+
+impl App {
+    /// Чат администратора для алертов мониторинга (в Telegram личный чат совпадает с id пользователя).
+    pub fn admin_chat(&self) -> Option<i64> {
+        self.cfg.admin_telegram_id
+    }
+
+    pub fn note_telegram_ok(&self, unix: i64) {
+        self.telegram_ok_at
+            .store(unix, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Снимок состояния для мониторинга (`/readyz` и сторож в `main`).
+    pub async fn vitals(&self, now: NaiveDateTime, now_unix: i64) -> crate::ops::Vitals {
+        let ok_at = self
+            .telegram_ok_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let backups = self.cfg.data_dir.as_ref().map(|d| d.join("backups"));
+        crate::ops::Vitals {
+            db_ok: sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(&self.pool)
+                .await
+                .is_ok(),
+            telegram_age_secs: (ok_at > 0).then_some(now_unix - ok_at),
+            disk_free_mb: self
+                .cfg
+                .data_dir
+                .as_ref()
+                .and_then(|d| fs2::available_space(d).ok())
+                .map(|b| b / 1_048_576),
+            backup_age_hours: backups
+                .as_ref()
+                .and_then(|d| crate::backup::mark_age_hours(&d.join("last_backup.json"), now)),
+            offsite_age_hours: backups
+                .as_ref()
+                .and_then(|d| crate::backup::mark_age_hours(&d.join("last_offsite.json"), now)),
+            offsite_expected: self.cfg.offsite_expected,
         }
     }
 }

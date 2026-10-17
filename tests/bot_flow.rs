@@ -63,10 +63,14 @@ struct H {
 
 impl H {
     async fn new() -> Self {
-        Self::with_photo_dir(None).await
+        Self::build(None, false).await
     }
 
     async fn with_photo_dir(photo_dir: Option<std::path::PathBuf>) -> Self {
+        Self::build(photo_dir, false).await
+    }
+
+    async fn build(photo_dir: Option<std::path::PathBuf>, allow_void_paid: bool) -> Self {
         let pool = db::connect("sqlite::memory:").await.unwrap();
         let ocr = Arc::new(FakeOcr::default());
         let app = App::new(
@@ -77,6 +81,8 @@ impl H {
                 photo_dir,
                 invite_ttl_days: 7,
                 ocr_enabled: false,
+                allow_void_paid,
+                ..Default::default()
             },
             ocr.clone(),
         );
@@ -1201,7 +1207,11 @@ impl H {
     /// Объект настроен 15 октября, арендатор подключён и отправил октябрьские показания (golden июля).
     /// Возвращает ответы на «Отправить» (в них — черновик владельцу).
     async fn october() -> (Self, Vec<Reply>) {
-        let h = Self::new().await;
+        Self::october_with(false).await
+    }
+
+    async fn october_with(allow_void_paid: bool) -> (Self, Vec<Reply>) {
+        let h = Self::build(None, allow_void_paid).await;
         h.setup(at(2026, 10, 15)).await;
         h.connect_tenant(at(2026, 10, 15)).await;
         let r = h
@@ -1519,7 +1529,11 @@ async fn reset_explains_what_to_do_for_each_bill_state() {
 impl H {
     /// Октябрьский счёт утверждён (но не оплачен); возвращает его id.
     async fn approved_october() -> (Self, i64) {
-        let (h, _) = H::october().await;
+        Self::approved_october_with(false).await
+    }
+
+    async fn approved_october_with(allow_void_paid: bool) -> (Self, i64) {
+        let (h, _) = H::october_with(allow_void_paid).await;
         let id: i64 = h.count("SELECT id FROM bill WHERE status = 'draft'").await;
         h.tap(LANDLORD, &format!("ap:{id}"), at(2026, 10, 17)).await;
         (h, id)
@@ -1633,7 +1647,7 @@ async fn duplicate_confirmation_voids_once_and_notifies_once() {
 
 #[tokio::test]
 async fn a_paid_bill_is_voided_only_through_its_own_explicit_confirmation() {
-    let (h, id) = H::approved_october().await;
+    let (h, id) = H::approved_october_with(true).await;
     let now = at(2026, 10, 18);
     // 1. подтверждение, начатое для неоплаченного счёта, не срабатывает, если счёт оплатили в промежутке
     h.void_until_confirm(id, now).await;
@@ -1802,4 +1816,16 @@ async fn no_reminders_without_schedule_after_submission_or_without_a_tenant() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn paid_bill_cannot_be_voided_by_default() {
+    let (h, id) = H::approved_october().await;
+    let now = at(2026, 10, 18);
+    h.tap(LANDLORD, &format!("pd:{id}"), now).await;
+    let r = h.say(LANDLORD, "/void", now).await;
+    assert!(r[0].text.contains("Нет утверждённых неоплаченных"), "{r:?}");
+    let r = h.tap(LANDLORD, &format!("vo:{id}"), now).await;
+    assert!(r[0].text.contains("оплачен"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["paid"]);
 }

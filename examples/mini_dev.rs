@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             photo_dir: Some(dir.join("photos")),
             invite_ttl_days: 7,
             ocr_enabled: true,
+            ..Default::default()
         },
         Arc::new(DemoOcr),
     ));

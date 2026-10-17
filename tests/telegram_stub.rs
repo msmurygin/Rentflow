@@ -177,6 +177,7 @@ async fn adapter_handles_text_photo_and_callback_end_to_end() {
             photo_dir: None,
             invite_ttl_days: 7,
             ocr_enabled: false,
+            ..Default::default()
         },
         Arc::new(NoExtractor),
     ));

@@ -61,6 +61,10 @@ fn jpeg(seed: u8) -> Vec<u8> {
 
 impl Api {
     async fn new() -> Self {
+        Self::build(true).await
+    }
+
+    async fn build(allow_void_paid: bool) -> Self {
         let pool = db::connect("sqlite::memory:").await.unwrap();
         let ocr = Arc::new(FakeOcr::default());
         let photos = std::env::temp_dir().join(format!("rentflow-api-{}", uuid::Uuid::new_v4()));
@@ -72,6 +76,8 @@ impl Api {
                 photo_dir: Some(photos),
                 invite_ttl_days: 7,
                 ocr_enabled: true,
+                allow_void_paid,
+                ..Default::default()
             },
             ocr.clone(),
         ));
@@ -1014,4 +1020,82 @@ async fn schedule_and_void_work_through_the_api() {
         .call(Method::GET, "/api/tariffs", Some(&landlord), None)
         .await;
     assert_eq!(v["items"].as_array().unwrap().len(), 5, "тарифы на месте");
+}
+
+#[tokio::test]
+async fn paid_void_is_refused_over_http_unless_the_test_flag_is_on() {
+    let api = Api::build(false).await;
+    let landlord = api.login(LANDLORD).await;
+    api.setup_property(&landlord).await;
+    sqlx::query("UPDATE property SET proof_required = 0")
+        .execute(api.app.pool())
+        .await
+        .unwrap();
+    let tenant = api.connect_tenant(&landlord).await;
+    for (code, value) in [
+        ("cold", "755"),
+        ("hot", "417"),
+        ("t1", "3975,48"),
+        ("t2", "1179"),
+    ] {
+        api.call(
+            Method::PUT,
+            "/api/readings/draft",
+            Some(&tenant),
+            Some(json!({ "code": code, "value": value })),
+        )
+        .await;
+    }
+    api.call(
+        Method::POST,
+        "/api/readings/submit",
+        Some(&tenant),
+        Some(json!({})),
+    )
+    .await;
+    let (_, v) = api
+        .call(Method::GET, "/api/bills", Some(&landlord), None)
+        .await;
+    let id = v["bills"][0]["id"].as_i64().unwrap();
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/approve"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    api.call(
+        Method::POST,
+        &format!("/api/bills/{id}/paid"),
+        Some(&landlord),
+        Some(json!({})),
+    )
+    .await;
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(d["can_void"], false);
+    let (s, _) = api
+        .call(
+            Method::POST,
+            &format!("/api/bills/{id}/void"),
+            Some(&landlord),
+            Some(json!({ "reason": "x", "confirm_paid": true })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, d) = api
+        .call(
+            Method::GET,
+            &format!("/api/bills/{id}"),
+            Some(&landlord),
+            None,
+        )
+        .await;
+    assert_eq!(d["status"], "paid");
 }
