@@ -2,7 +2,7 @@
 
 | # | Этап | Статус |
 |---|---|---|
-| 1 | Stabilization & Safety: void по спецификации, backup/restore, health/alerts | **частично**: готовы void-флаг, backup/verify/restore (код), /readyz, алерты; нет тестов backup/restore, offsite-скриптов и DEPLOY.md |
+| 1 | Stabilization & Safety: void по спецификации, backup/restore, health/alerts | **готово**: ALLOW_VOID_PAID, backup/verify/restore/migrate-check + тесты, offsite-скрипт (age+rclone), /readyz, алерты, DEPLOY.md. Не проверено на живом сервере: offsite-скрипты, docker healthcheck |
 | 2 | Multi-Tenant Core: membership, property-scoped авторизация, миграция prod, изоляция | — |
 | 3 | Self-Service Mini App: регистрация, мастер с resume, переключение квартир | — |
 | 4 | Recurring Operations: timezone объекта, reading_day 29–31, срок оплаты/overdue, история | — |

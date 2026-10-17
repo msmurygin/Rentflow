@@ -281,3 +281,36 @@ pub fn mark_age_hours(file: &Path, now: NaiveDateTime) -> Option<i64> {
     let at = NaiveDateTime::parse_from_str(v["at"].as_str()?, "%Y-%m-%dT%H:%M:%S").ok()?;
     Some((now - at).num_hours())
 }
+
+/// Открывает базу (применяя недостающие миграции) и проверяет её: так проверяется, что НОВЫЙ выпуск
+/// принимает данные production. Запускать только на восстановленной копии, не на рабочей базе.
+pub async fn migrate_check(database_url: &str) -> Result<Report> {
+    let pool = crate::db::connect(database_url)
+        .await
+        .context("миграции не применились")?;
+    let mut report = Report::default();
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&pool)
+        .await?;
+    if integrity != "ok" {
+        report
+            .problems
+            .push(format!("integrity_check: {integrity}"));
+    }
+    let fk: Vec<(String,)> = sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+    if !fk.is_empty() {
+        report
+            .problems
+            .push(format!("нарушены внешние ключи: {} строк", fk.len()));
+    }
+    report.schema_version =
+        sqlx::query_scalar("SELECT coalesce(max(version), 0) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await?;
+    report.rows = count_rows(&pool).await?;
+    pool.close().await;
+    Ok(report)
+}

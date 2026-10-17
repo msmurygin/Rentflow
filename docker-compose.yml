@@ -15,6 +15,11 @@ services:
       PHOTO_DIR: /data/photos
     volumes:
       - rentflow-data:/data
+    healthcheck:
+      test: ["CMD", "rentflow", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   caddy:
     image: caddy:2

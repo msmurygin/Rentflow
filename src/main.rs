@@ -62,6 +62,15 @@ async fn cli(cmd: &str, args: &[String]) -> Result<()> {
             println!("восстановлено в {dst}");
             Ok(())
         }
+        "migrate-check" => {
+            let report = backup::migrate_check(&database_url).await?;
+            println!("схема {}, строк: {:?}", report.schema_version, report.rows);
+            if !report.ok() {
+                anyhow::bail!("база не прошла проверку: {}", report.problems.join("; "));
+            }
+            println!("миграции применены, база в порядке");
+            Ok(())
+        }
         "backup-mark-offsite" => backup::mark_offsite(&backups_root(), now),
         "healthcheck" => {
             let bind = env("HTTP_BIND").unwrap_or_else(|| "0.0.0.0:8080".into());
