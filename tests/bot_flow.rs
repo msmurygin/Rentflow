@@ -1492,3 +1492,173 @@ async fn history_is_monthly() {
     assert!(t.contains("с 2026-12"), "{t}");
     assert!(t.contains("ещё не вступил"), "{t}");
 }
+
+#[tokio::test]
+async fn reset_explains_what_to_do_for_each_bill_state() {
+    let (h, _) = H::october().await;
+    let now = at(2026, 10, 17);
+    let r = h.say(LANDLORD, "/reset", now).await;
+    assert!(r[0].text.contains("«Отклонить»"), "черновик: {r:?}");
+    let id: i64 = h.count("SELECT id FROM bill WHERE status = 'draft'").await;
+    h.tap(LANDLORD, &format!("ap:{id}"), now).await;
+    let r = h.say(LANDLORD, "/reset", now).await;
+    assert!(
+        r[0].text.contains("/reissue") && !r[0].text.contains("кнопкой «Отклонить»"),
+        "утверждён: {r:?}"
+    );
+    h.tap(LANDLORD, &format!("pd:{id}"), now).await;
+    let r = h.say(LANDLORD, "/reset", now).await;
+    assert!(
+        r[0].text.contains("оплачен") && !r[0].text.contains("/reissue"),
+        "оплачен: {r:?}"
+    );
+}
+
+// ---------- /void ----------
+
+impl H {
+    /// Октябрьский счёт утверждён (но не оплачен); возвращает его id.
+    async fn approved_october() -> (Self, i64) {
+        let (h, _) = H::october().await;
+        let id: i64 = h.count("SELECT id FROM bill WHERE status = 'draft'").await;
+        h.tap(LANDLORD, &format!("ap:{id}"), at(2026, 10, 17)).await;
+        (h, id)
+    }
+
+    /// /void → выбор счёта → причина → кнопка подтверждения; возвращает ответы на причину.
+    async fn void_until_confirm(&self, id: i64, now: NaiveDateTime) -> Vec<Reply> {
+        let r = self.say(LANDLORD, "/void", now).await;
+        assert!(buttons(&r).contains(&format!("vo:{id}")), "{r:?}");
+        self.tap(LANDLORD, &format!("vo:{id}"), now).await;
+        self.say(LANDLORD, "тестовый счёт", now).await
+    }
+}
+
+#[tokio::test]
+async fn approved_void_reopens_the_period_for_new_readings_and_a_new_bill() {
+    let (h, id) = H::approved_october().await;
+    let now = at(2026, 10, 18);
+    let settings_before = (
+        h.count("SELECT count(*) FROM tariff").await,
+        h.count("SELECT count(*) FROM reading WHERE kind = 'baseline'")
+            .await,
+        h.count("SELECT count(*) FROM tenancy WHERE tenant_user_id IS NOT NULL")
+            .await,
+    );
+
+    let r = h.void_until_confirm(id, now).await;
+    assert!(r[0].text.contains("Причина: тестовый счёт"), "{r:?}");
+    // до подтверждения ничего не изменилось
+    assert_eq!(h.status_of("2026-10").await, ["approved"]);
+
+    let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(to_chat(&r, TENANT).contains("аннулирован"), "{r:?}");
+    assert!(to_chat(&r, TENANT).contains("тестовый счёт"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["void"]);
+    let (note, snapshot): (String, String) =
+        sqlx::query_as("SELECT note, snapshot FROM bill WHERE id = ?")
+            .bind(id)
+            .fetch_one(h.app.pool())
+            .await
+            .unwrap();
+    assert!(note.contains("тестовый счёт"));
+    assert!(snapshot.contains("2063.61"), "исходный счёт сохранён");
+    assert_eq!(
+        h.count("SELECT count(*) FROM audit_log WHERE action = 'bill_void'")
+            .await,
+        1
+    );
+
+    // настройки, тарифы, стартовые показания и арендатор на месте
+    let settings_after = (
+        h.count("SELECT count(*) FROM tariff").await,
+        h.count("SELECT count(*) FROM reading WHERE kind = 'baseline'")
+            .await,
+        h.count("SELECT count(*) FROM tenancy WHERE tenant_user_id IS NOT NULL")
+            .await,
+    );
+    assert_eq!(settings_before, settings_after);
+
+    // новые показания и новый счёт за тот же период
+    let r = h
+        .month(at(2026, 10, 19), ["756", "418", "3980", "1180"])
+        .await;
+    assert!(all_text(&r).contains("Расчёт за 2026-10"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["void", "draft"]);
+}
+
+#[tokio::test]
+async fn void_needs_a_reason_and_an_explicit_confirmation() {
+    let (h, id) = H::approved_october().await;
+    let now = at(2026, 10, 18);
+    h.say(LANDLORD, "/void", now).await;
+    h.tap(LANDLORD, &format!("vo:{id}"), now).await;
+    let r = h.say(LANDLORD, "   ", now).await;
+    assert!(r[0].text.contains("Причина"), "{r:?}");
+    // подтверждение без причины и чужой id не действуют
+    let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(r[0].text.contains("устарело"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["approved"]);
+    // отмена оставляет счёт
+    h.void_until_confirm(id, now).await;
+    h.tap(LANDLORD, "vx", now).await;
+    let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(r[0].text.contains("устарело"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["approved"]);
+}
+
+#[tokio::test]
+async fn duplicate_confirmation_voids_once_and_notifies_once() {
+    let (h, id) = H::approved_october().await;
+    let now = at(2026, 10, 18);
+    h.void_until_confirm(id, now).await;
+    let first = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    let second = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(!to_chat(&first, TENANT).is_empty());
+    assert!(
+        to_chat(&second, TENANT).is_empty(),
+        "повтор ничего не рассылает: {second:?}"
+    );
+    assert_eq!(
+        h.count("SELECT count(*) FROM audit_log WHERE action = 'bill_void'")
+            .await,
+        1
+    );
+    // повторное нажатие не воссоздаёт счёт и не трогает новые показания
+    h.month(at(2026, 10, 19), ["756", "418", "3980", "1180"])
+        .await;
+    h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert_eq!(h.status_of("2026-10").await, ["void", "draft"]);
+}
+
+#[tokio::test]
+async fn paid_and_draft_bills_are_never_voided() {
+    let (h, id) = H::approved_october().await;
+    let now = at(2026, 10, 18);
+    // оплаченный: нет ни в списке, ни по прямому вызову
+    h.void_until_confirm(id, now).await; // состояние начато, пока счёт ещё утверждён
+    h.tap(LANDLORD, &format!("pd:{id}"), now).await; // оплата отмечена в промежутке
+    let r = h.tap(LANDLORD, &format!("vc:{id}"), now).await;
+    assert!(
+        r[0].text.contains("уже изменён") || r[0].text.contains("устарело"),
+        "{r:?}"
+    );
+    assert_eq!(h.status_of("2026-10").await, ["paid"]);
+    let r = h.say(LANDLORD, "/void", now).await;
+    assert!(r[0].text.contains("Нет утверждённых"), "{r:?}");
+    let r = h.tap(LANDLORD, &format!("vo:{id}"), now).await;
+    assert!(r[0].text.contains("оплачен"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["paid"]);
+    // арендатор команду не получает
+    let r = h.tap(TENANT, &format!("vc:{id}"), now).await;
+    assert!(r[0].text.contains("недоступно"), "{r:?}");
+}
+
+#[tokio::test]
+async fn void_of_a_draft_is_refused() {
+    let (h, _) = H::october().await;
+    let id: i64 = h.count("SELECT id FROM bill WHERE status = 'draft'").await;
+    let r = h.tap(LANDLORD, &format!("vo:{id}"), at(2026, 10, 18)).await;
+    assert!(r[0].text.contains("только утверждённый"), "{r:?}");
+    assert_eq!(h.status_of("2026-10").await, ["draft"]);
+}

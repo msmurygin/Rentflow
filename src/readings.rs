@@ -274,10 +274,25 @@ impl App {
             return user_err("Объект не настроен.");
         };
         let period = self.open_period(property_id, now).await?;
-        if self.period_billed(property_id, &period).await? {
-            return user_err(
-                "По этому периоду уже есть счёт. Отклоните его кнопкой «Отклонить» — показания откроются заново.",
-            );
+        // Что делать, зависит от того, в каком состоянии счёт: кнопка «Отклонить» есть только у черновика.
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM bill WHERE property_id = ? AND period = ? AND status IN ('draft','approved','paid')",
+        )
+        .bind(property_id)
+        .bind(&period)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(status) = active {
+            return user_err(match status.as_str() {
+                "draft" => format!(
+                    "За {period} есть черновик счёта. Отклоните его кнопкой «Отклонить» под расчётом — показания откроются заново."
+                ),
+                "approved" => format!(
+                    "Счёт за {period} уже утверждён и отправлен арендатору, сбросить показания нельзя. \
+                     Пересчитать по текущим тарифам — /reissue, аннулировать (например, тестовый счёт) — /void."
+                ),
+                _ => format!("Счёт за {period} уже оплачен — сбросить показания нельзя."),
+            });
         }
         self.supersede_period(property_id, &period).await?;
         Ok(vec![Reply::text(

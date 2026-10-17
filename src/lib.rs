@@ -12,3 +12,4 @@ pub mod reissue;
 pub mod setup;
 pub mod tariffs;
 pub mod util;
+pub mod void;

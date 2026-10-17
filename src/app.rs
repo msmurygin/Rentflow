@@ -131,6 +131,11 @@ pub enum State {
     Entry { code: String, edit: bool },
     /// Число для `code` уже введено, ждём фото-подтверждение (если оно обязательно).
     Proof { code: String, edit: bool },
+    /// Аннулирование утверждённого счёта: выбран счёт, потом причина, потом подтверждение.
+    Void {
+        bill_id: i64,
+        reason: Option<String>,
+    },
     /// Меню тарифов: выбрана ли дата, номер шага и ответы (`keep` | `off` | цена).
     Tariff {
         month: Option<String>,
@@ -326,6 +331,7 @@ impl App {
                 /tariff — изменить тарифы по шагам (или одной строкой: /tariff cold 66.87 2026-08-01; коды: cold hot sewer t1 t2)\n\
                 /paid — отметить счёт оплаченным\n\
                 /reset — сбросить неполные показания периода\n\
+                /void — аннулировать утверждённый неоплаченный счёт (с причиной)\n\
                 /calc — пересчитать период, когда все показания уже приняты\n\
                 /whoami — ваш Telegram-ID"
             }
@@ -374,6 +380,7 @@ impl App {
                 "/proof" => self.proof_cmd(from).await,
                 "/paid" => self.paid_list(from).await,
                 "/reissue" => self.reissue_list(from).await,
+                "/void" => self.void_list(from).await,
                 "/reset" => self.reset_period(from, now).await,
                 "/calc" => self.calc_cmd(from, now).await,
                 c if c.starts_with('/') => Ok(vec![self.help(from, who)]),
@@ -416,6 +423,9 @@ impl App {
             (Who::Landlord(_), "tm") => self.tariff_month(from, a.unwrap_or(""), now).await,
             (Who::Landlord(_), "ri") => self.reissue_ask(from, id.unwrap_or(0), now).await,
             (Who::Landlord(_), "rc") => self.reissue_do(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "vo") => self.void_pick(from, id.unwrap_or(0)).await,
+            (Who::Landlord(_), "vc") => self.void_confirm(from, id.unwrap_or(0), now).await,
+            (Who::Landlord(_), "vx") => self.void_cancel(from).await,
             (Who::Landlord(_), "rx") => {
                 Ok(vec![Reply::text(from.chat_id, "Оставлено без изменений.")])
             }

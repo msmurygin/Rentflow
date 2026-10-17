@@ -252,8 +252,10 @@ impl App {
         text: &str,
         now: NaiveDateTime,
     ) -> Res<Vec<Reply>> {
-        if let Some(State::Tariff { .. }) = self.state(from.telegram_id).await? {
-            return self.tariff_text(from, text, now).await;
+        match self.state(from.telegram_id).await? {
+            Some(State::Tariff { .. }) => return self.tariff_text(from, text, now).await,
+            Some(State::Void { .. }) => return self.void_reason(from, text).await,
+            _ => {}
         }
         let Some(State::Setup { step, mut answers }) = self.state(from.telegram_id).await? else {
             return Ok(vec![Reply::text(
