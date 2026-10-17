@@ -2,14 +2,25 @@
 name = "rentflow"
 version = "0.1.0"
 edition = "2024"
+default-run = "rentflow"
 
 [dependencies]
-rust_decimal = "1.43.0"
-serde_json = "1.0.154"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "uuid", "rust_decimal", "json", "macros"] }
-thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
-uuid = { version = "1.28.0", features = ["serde", "v4"] }
+anyhow = "1"
+async-trait = "0.1.92"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-rust_decimal_macros = "1.40.0"
+rust_decimal_macros = "1"

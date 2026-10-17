@@ -125,12 +125,13 @@ pub fn calculate_with(
         let previous_raw = m
             .previous
             .ok_or_else(|| BillingError::MissingPrevious(m.meter_id.clone()))?;
-        let tariff = m
-            .tariff
-            .ok_or_else(|| BillingError::MissingTariff(m.meter_id.clone()))?;
+        // Смена тарифа внутри периода важнее «нет тарифа»: цена есть, но выбрать её молча нельзя.
         if m.tariff_changed_in_period {
             return Err(BillingError::TariffChangedInPeriod(m.meter_id.clone()));
         }
+        let tariff = m
+            .tariff
+            .ok_or_else(|| BillingError::MissingTariff(m.meter_id.clone()))?;
         if previous_raw.is_sign_negative()
             || current_raw.is_sign_negative()
             || tariff.is_sign_negative()

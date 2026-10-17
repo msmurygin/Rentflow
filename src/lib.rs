@@ -1,6 +1,10 @@
-//! RentFlow R0 — расчётное ядро и утверждение счетов.
+//! RentFlow: Telegram-бот для расчёта коммунальных платежей между арендатором и владельцем.
 
-pub mod approval;
+pub mod app;
 pub mod billing;
-pub mod calculation;
-pub mod lifecycle;
+pub mod bills;
+pub mod db;
+pub mod ocr;
+pub mod readings;
+pub mod setup;
+pub mod util;
