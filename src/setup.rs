@@ -206,6 +206,87 @@ impl App {
         Ok(property_id)
     }
 
+    /// Можно ли ещё менять стартовые показания: пока по квартире нет ни одного счёта (кроме отклонённых),
+    /// они — якорь первого расчёта. После первого счёта якорем служит последнее принятое показание.
+    pub async fn baselines_editable(&self, property_id: i64) -> Res<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bill WHERE property_id = ? AND status <> 'rejected'",
+        )
+        .bind(property_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n == 0)
+    }
+
+    /// Исправляет стартовые показания включённых счётчиков. Старое показание не затирается — оно становится
+    /// `superseded`. Всё или ничего: любая ошибка в наборе оставляет данные как были. Названные не все счётчики —
+    /// остальные не меняются.
+    pub async fn set_baselines(
+        &self,
+        property_id: i64,
+        actor_user_id: i64,
+        values: &[(String, String)],
+        base_date: Option<&str>,
+        now: NaiveDateTime,
+    ) -> Res<()> {
+        if values.is_empty() {
+            return user_err("Укажите хотя бы одно стартовое показание.");
+        }
+        let mut tx = self.pool.begin().await?;
+        // проверка внутри транзакции: счёт не должен появиться между проверкой и записью
+        let bills: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bill WHERE property_id = ? AND status <> 'rejected'",
+        )
+        .bind(property_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if bills > 0 {
+            return user_err("Стартовые показания уже нельзя менять: по квартире есть счета.");
+        }
+        let ts = now_iso(now);
+        for (code, value) in values {
+            let register: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM register WHERE property_id = ? AND code = ? AND enabled = 1",
+            )
+            .bind(property_id)
+            .bind(code)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(register_id) = register else {
+                return user_err(format!(
+                    "Счётчик «{}» не используется в этой квартире.",
+                    label(code)
+                ));
+            };
+            let old_date: Option<String> = sqlx::query_scalar(
+                "SELECT read_on FROM reading WHERE register_id = ? AND kind = 'baseline' AND status = 'confirmed'",
+            )
+            .bind(register_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+            sqlx::query(
+                "UPDATE reading SET status = 'superseded' WHERE register_id = ? AND kind = 'baseline' AND status = 'confirmed'",
+            )
+            .bind(register_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO reading (register_id, period, kind, value, read_on, source, status, confirmed_by, created_at)
+                 VALUES (?, '0000-00', 'baseline', ?, ?, 'baseline', 'confirmed', ?, ?)",
+            )
+            .bind(register_id)
+            .bind(value)
+            .bind(base_date.map(String::from).or(old_date))
+            .bind(actor_user_id)
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Новая одноразовая ссылка-приглашение (прежние неиспользованные гасятся); возвращает токен.
     pub async fn create_invite(&self, property_id: i64, now: NaiveDateTime) -> Res<String> {
         let linked: Option<i64> =

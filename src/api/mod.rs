@@ -16,7 +16,7 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
     http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::Deserialize;
@@ -466,6 +466,7 @@ async fn property_json(st: &ApiState, ctx: &Ctx, property_id: i64) -> Result<Val
         "name": name,
         "tenant_name": tenant_name,
         "tenant_connected": tenant_user.is_some(),
+        "baselines_editable": st.app.baselines_editable(property_id).await?,
         "reading_day": st.app.reading_rule(property_id).await?.map(|r| r.api_day()),
         "payment_days": sqlx::query_scalar::<_, i64>("SELECT payment_days FROM property WHERE id = ?").bind(property_id).fetch_one(st.app.pool()).await?,
         "registers": registers,
@@ -663,6 +664,73 @@ async fn list_properties(State(st): St, ctx: Ctx) -> ApiResult {
         out.push(json!({ "id": pid, "name": name, "role": if role == MRole::Owner { "owner" } else { "tenant" }, "active": active == Some(pid) }));
     }
     Ok(Json(json!({ "properties": out })))
+}
+
+#[derive(Deserialize)]
+struct BaselinesBody {
+    baselines: HashMap<String, String>,
+    base_date: Option<String>,
+}
+
+/// `PUT /api/property/baselines` — исправление стартовых показаний, пока по квартире нет счетов.
+async fn put_baselines(State(st): St, ctx: Ctx, Json(b): Json<BaselinesBody>) -> ApiResult {
+    let user_id = match &ctx.role {
+        Role::Landlord(u) => u.id,
+        Role::Tenant(_) => return Err(ApiError::Forbidden("Только для владельца.")),
+    };
+    let property_id = st.need_property(&ctx).await?;
+    let mut values = vec![];
+    for (code, raw) in &b.baselines {
+        if !is_register(code) {
+            return bad("Неизвестный счётчик.");
+        }
+        let d = parse_decimal(raw).ok_or_else(|| {
+            ApiError::User(format!(
+                "Стартовые показания: «{}» — нужно число.",
+                label(code)
+            ))
+        })?;
+        values.push((code.clone(), d.to_string()));
+    }
+    let base_date = match b
+        .base_date
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(d) => Some(
+            parse_date(d)
+                .ok_or(ApiError::User("Дата показаний: ГГГГ-ММ-ДД.".into()))?
+                .to_string(),
+        ),
+    };
+    if !st.app.baselines_editable(property_id).await? {
+        return Err(ApiError::Conflict(
+            "Стартовые показания уже нельзя менять: по квартире есть счета.".into(),
+        ));
+    }
+    values.sort();
+    st.app
+        .set_baselines(
+            property_id,
+            user_id,
+            &values,
+            base_date.as_deref(),
+            st.now(),
+        )
+        .await?;
+    st.audit(
+        &ctx,
+        "baselines_update",
+        "property",
+        Some(property_id.to_string()),
+        json!({ "registers": values.iter().map(|(c, v)| json!({ "code": c, "value": v })).collect::<Vec<_>>(), "base_date": base_date }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "property": property_json(&st, &ctx, property_id).await? }),
+    ))
 }
 
 async fn put_property(State(st): St, ctx: Ctx, Json(b): Json<PropertyBody>) -> ApiResult {
@@ -1531,6 +1599,7 @@ pub fn router(state: Arc<ApiState>, static_dir: Option<PathBuf>) -> Router {
         .route("/register", post(register))
         .route("/home", get(home))
         .route("/property", get(get_property).put(put_property))
+        .route("/property/baselines", put(put_baselines))
         .route("/properties", get(list_properties).post(post_property))
         .route("/invitations", post(create_invitation))
         .route("/invitations/accept", post(invitation_accept))

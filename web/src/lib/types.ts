@@ -30,6 +30,7 @@ export interface Property {
   reading_day: number | null;
   payment_days: number;
   proof_required?: boolean;
+  baselines_editable?: boolean;
   registers: Register[];
 }
 export interface BillSummary {

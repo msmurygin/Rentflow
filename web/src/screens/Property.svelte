@@ -27,6 +27,9 @@
   let busy = $state(false);
 
   let editing = $state(false);
+  let fixing = $state(false);
+  let fixValues = $state<Record<string, string>>({});
+  let fixDate = $state('');
   let invite = $state<{ url: string; ttl_days: number } | null>(null);
 
   async function patch(body: Record<string, unknown>) {
@@ -35,6 +38,27 @@
       await api.put('/property', body);
       await l2.reload();
       editing = false;
+    } catch (e) {
+      notify(errorText(e, t('genericError'), t('offline')), 'err');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveBaselines(p: Property) {
+    for (const r of p.registers) {
+      if (!isValidNumber(fixValues[r.code] ?? '')) {
+        errors[r.code] = t('property.baselineNumber');
+        return;
+      }
+      errors[r.code] = '';
+    }
+    busy = true;
+    try {
+      await api.put('/property/baselines', { baselines: fixValues, base_date: fixDate.trim() || null });
+      await l2.reload();
+      fixing = false;
+      notify(t('property.baselinesSaved'));
     } catch (e) {
       notify(errorText(e, t('genericError'), t('offline')), 'err');
     } finally {
@@ -93,6 +117,22 @@
         <Card>
           <p class="text-sm">{p.payment_days ? t('property.paymentDaysShow', { days: p.payment_days }) + ' · ' : ''}{p.reading_day ? (p.reading_day > 28 ? t('property.readingDayLast') : t('property.readingDayShow', { day: p.reading_day })) : t('property.readingDayNone')}</p>
         </Card>
+
+        {#if landlord && p.baselines_editable}
+          {#if fixing}
+            <Card class="grid gap-3">
+              <h2 class="font-semibold">{t('property.baselines')}</h2>
+              <p class="text-sm text-muted">{t('property.fixBaselinesHint')}</p>
+              {#each p.registers as r (r.code)}
+                <Field label={`${t(`reg.${r.code}` as Key)}, ${r.unit}`} bind:value={fixValues[r.code]} inputmode="decimal" error={errors[r.code]} />
+              {/each}
+              <Field label={t('property.baseDate')} bind:value={fixDate} placeholder="2026-09-30" hint={t('property.baseDateHint')} />
+              <Btn {busy} onclick={() => saveBaselines(p)}>{t('save')}</Btn>
+            </Card>
+          {:else}
+            <Btn variant="secondary" onclick={() => { fixValues = Object.fromEntries(p.registers.map((r) => [r.code, r.baseline])); fixDate = p.registers[0]?.baseline_date ?? ''; errors = {}; fixing = true; }}>{t('property.fixBaselines')}</Btn>
+          {/if}
+        {/if}
 
         <Card>
           <h2 class="mb-2 font-semibold">{t('property.registers')}</h2>
