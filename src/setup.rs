@@ -109,6 +109,24 @@ pub struct NewProperty {
     pub tz_offset_hours: Option<i64>,
 }
 
+/// Что держит стартовые показания закрытыми: действующие счета (черновик, утверждён, оплачен) и принятые показания
+/// периодов, по которым есть счёт. Аннулирование снимает показания периода (`superseded`), поэтому после него,
+/// если других счетов нет, точкой отсчёта снова служат стартовые показания.
+async fn baselines_locked(
+    conn: &mut sqlx::SqliteConnection,
+    property_id: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM bill WHERE property_id = ?1 AND status IN ('draft', 'approved', 'paid'))
+              + (SELECT COUNT(*) FROM reading r JOIN register g ON g.id = r.register_id
+                  WHERE g.property_id = ?1 AND r.kind = 'submitted' AND r.status = 'confirmed'
+                    AND r.period IN (SELECT period FROM bill WHERE property_id = ?1 AND status <> 'rejected'))",
+    )
+    .bind(property_id)
+    .fetch_one(conn)
+    .await
+}
+
 impl App {
     /// Создаёт объект, арендатора, регистры, стартовые показания (начислений не создают) и тарифы текущего месяца.
     pub async fn create_property(
@@ -209,13 +227,8 @@ impl App {
     /// Можно ли ещё менять стартовые показания: пока по квартире нет ни одного счёта (кроме отклонённых),
     /// они — якорь первого расчёта. После первого счёта якорем служит последнее принятое показание.
     pub async fn baselines_editable(&self, property_id: i64) -> Res<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM bill WHERE property_id = ? AND status <> 'rejected'",
-        )
-        .bind(property_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(n == 0)
+        let mut conn = self.pool.acquire().await?;
+        Ok(baselines_locked(&mut conn, property_id).await? == 0)
     }
 
     /// Исправляет стартовые показания включённых счётчиков. Старое показание не затирается — оно становится
@@ -234,13 +247,7 @@ impl App {
         }
         let mut tx = self.pool.begin().await?;
         // проверка внутри транзакции: счёт не должен появиться между проверкой и записью
-        let bills: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM bill WHERE property_id = ? AND status <> 'rejected'",
-        )
-        .bind(property_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if bills > 0 {
+        if baselines_locked(&mut tx, property_id).await? > 0 {
             return user_err("Стартовые показания уже нельзя менять: по квартире есть счета.");
         }
         let ts = now_iso(now);

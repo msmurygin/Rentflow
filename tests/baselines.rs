@@ -163,3 +163,51 @@ async fn a_disabled_register_cannot_be_given_a_baseline() {
     let (s, _) = put(&w, &o, p, json!({"baselines": {"t2": "5"}})).await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn baselines_open_again_when_every_bill_was_voided() {
+    let w = World::new().await;
+    let o = w.owner(OWNER_A).await;
+    let p = w.create_property(&o, "Кв").await;
+    let t = w.join_tenant(&o, p, TENANT_A).await;
+    let bill = w.bill(&o, &t, p, ["2", "2", "10", "10"]).await;
+    let (s, _) = put(&w, &o, p, json!({"baselines": {"cold": "9"}})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "пока счёт жив — закрыто");
+    let (s, _) = w
+        .call(
+            Method::POST,
+            &format!("/api/bills/{bill}/approve"),
+            Some(&o),
+            Some(p),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = put(&w, &o, p, json!({"baselines": {"cold": "9"}})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "утверждён — закрыто");
+    let (s, v) = w
+        .call(
+            Method::POST,
+            &format!("/api/bills/{bill}/void"),
+            Some(&o),
+            Some(p),
+            Some(json!({"reason": "ошибка"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let (_, v) = w
+        .call(Method::GET, "/api/property", Some(&o), Some(p), None)
+        .await;
+    assert_eq!(v["property"]["baselines_editable"], true);
+    let (s, r) = put(
+        &w,
+        &o,
+        p,
+        json!({"baselines": {"cold": "761", "hot": "420", "t1": "148", "t2": "60"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let b = baselines(&w, &o, p).await;
+    assert!(b.contains(&("t2".into(), "60".into())), "{b:?}");
+}
