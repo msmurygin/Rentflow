@@ -109,3 +109,9 @@ Smoke после выкладки (дополнительно): `/privacy` в б
 **Откат:** образ M5 схему не меняет — вариант A (`git checkout $(cat /var/backups/rentflow/previous_release) && docker compose up -d --build`).
 Старый образ демо-пользователей не знает: если демо уже создано, они остаются в базе как неактивные записи (безвредно).
 Если нужно убрать демо целиком — см. `docs/v0.3/PRIVACY.md`/админ: удалить квартиры `landlord_id` пользователя с `telegram_id = -1000` после копии базы.
+
+## Стартовые показания вручную (CLI)
+Только пока по квартире нет счетов. Сначала резервная копия (`rentflow backup`). Показывает, что изменится:
+`docker compose exec -T rentflow rentflow set-baselines <id> cold=761 hot=420 t1=148 t2=60`
+и применяет с `--yes` (опционально `--date ГГГГ-ММ-ДД`). Старые значения остаются `superseded`, пишется `audit_log`.
+Id квартиры: `SELECT id, name FROM property;`

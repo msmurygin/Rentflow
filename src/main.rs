@@ -42,6 +42,72 @@ async fn cli(cmd: &str, args: &[String]) -> Result<()> {
             println!("{}", dir.display());
             Ok(())
         }
+        "set-baselines" => {
+            // rentflow set-baselines <property_id> cold=761 hot=420 t1=148 t2=60 [--date YYYY-MM-DD] [--yes]
+            // Без --yes только показывает, что изменится. Логика та же, что у кнопки в Mini App.
+            let pid: i64 = args
+                .first()
+                .and_then(|a| a.parse().ok())
+                .context("использование: rentflow set-baselines <id квартиры> cold=… hot=… t1=… t2=… [--date ГГГГ-ММ-ДД] [--yes]")?;
+            let yes = args.iter().any(|a| a == "--yes");
+            let date = args
+                .iter()
+                .position(|a| a == "--date")
+                .and_then(|i| args.get(i + 1))
+                .cloned();
+            let mut values = vec![];
+            for a in args.iter().skip(1).filter(|a| a.contains('=')) {
+                let (code, raw) = a.split_once('=').unwrap();
+                let d = rentflow::util::parse_decimal(raw)
+                    .with_context(|| format!("«{a}»: нужно неотрицательное число"))?;
+                values.push((code.to_string(), d.to_string()));
+            }
+            let pool = rentflow::db::connect(&database_url).await?;
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT g.code, r.value FROM register g JOIN reading r ON r.register_id = g.id
+                  AND r.kind = 'baseline' AND r.status = 'confirmed' WHERE g.property_id = ? AND g.enabled = 1 ORDER BY g.id",
+            )
+            .bind(pid)
+            .fetch_all(&pool)
+            .await?;
+            anyhow::ensure!(
+                !rows.is_empty(),
+                "квартира {pid} не найдена или без счётчиков"
+            );
+            for (code, old) in &rows {
+                let new = values
+                    .iter()
+                    .find(|(c, _)| c == code)
+                    .map(|(_, v)| v.as_str());
+                println!("{code}: {old} -> {}", new.unwrap_or("(без изменений)"));
+            }
+            if !yes {
+                println!("Ничего не записано. Добавьте --yes, чтобы применить.");
+                return Ok(());
+            }
+            let app = App::new(pool.clone(), Default::default(), Arc::new(NoExtractor));
+            anyhow::ensure!(
+                app.baselines_editable(pid).await?,
+                "по квартире уже есть счета — стартовые показания закрыты"
+            );
+            let (landlord_id, telegram_id): (i64, i64) = sqlx::query_as(
+                "SELECT p.landlord_id, u.telegram_id FROM property p JOIN app_user u ON u.id = p.landlord_id WHERE p.id = ?",
+            )
+            .bind(pid)
+            .fetch_one(&pool)
+            .await?;
+            app.set_baselines(pid, landlord_id, &values, date.as_deref(), now)
+                .await?;
+            sqlx::query("INSERT INTO audit_log (at, actor, action, entity, entity_id, details) VALUES (?, ?, 'baselines_update', 'property', ?, ?)")
+                .bind(rentflow::app::now_iso(now))
+                .bind(telegram_id)
+                .bind(pid.to_string())
+                .bind(serde_json::json!({ "via": "cli", "registers": values }).to_string())
+                .execute(&pool)
+                .await?;
+            println!("Готово.");
+            Ok(())
+        }
         "metrics" => {
             let pool = rentflow::db::connect(&database_url).await?;
             let app = rentflow::app::App::new(
